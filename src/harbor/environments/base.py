@@ -9,7 +9,7 @@ import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Generator, Sequence
 from pathlib import Path, PurePath, PurePosixPath
-from typing import Literal
+from typing import Literal, TYPE_CHECKING
 
 from pydantic import BaseModel
 
@@ -28,6 +28,9 @@ from harbor.utils.env import resolve_env_vars
 from harbor.utils.logger import logger as global_logger
 from harbor.utils.scripts import quote_shell_arg
 
+if TYPE_CHECKING:
+    from harbor.environments.launch import LaunchSpec
+
 EnvironmentPath = str | PurePath
 _TRANSFER_TAR_FILENAME = ".hb-transfer.tar.gz"
 _ENV_TRANSFER_TAR_PATH = str(PurePosixPath("/tmp") / _TRANSFER_TAR_FILENAME)
@@ -41,6 +44,20 @@ class ExecResult(BaseModel):
     stdout: str | None = None
     stderr: str | None = None
     return_code: int
+
+
+def _drop_special_files(member, dest_path):
+    """tarfile extraction filter: the ``data`` filter, but skipping special files.
+
+    ``filter="data"`` raises ``SpecialFileError`` on a FIFO, socket or device node
+    instead of ignoring it, and one raise here discards a whole build, its source and
+    its artifact image. What an agent leaves in its workspace is not bounded
+    by anything we control, and a pipe is not a deliverable, so drop it and keep the
+    rest of the tree.
+    """
+    if member.isfifo() or member.ischr() or member.isblk() or member.isdev():
+        return None
+    return tarfile.data_filter(member, dest_path)
 
 
 class BaseEnvironment(ABC):
@@ -503,6 +520,16 @@ class BaseEnvironment(ABC):
         )
         return self.os
 
+    async def image_digest(self) -> str | None:
+        """Best-effort content id of this environment's deployed image.
+
+        Backends that can resolve it override this (Docker -> image content id,
+        Modal -> built-image object id). The default returns ``None`` so backends
+        that cannot — or have nothing deployed yet — simply contribute no digest.
+        Never raises: a digest is provenance, not correctness.
+        """
+        return None
+
     _LEGACY_CAPABILITY_ATTRS: dict[str, str] = {
         "supports_gpus": "gpus",
         "can_disable_internet": "disable_internet",
@@ -694,9 +721,14 @@ class BaseEnvironment(ABC):
         env_tar_path = shlex.quote(_ENV_TRANSFER_TAR_PATH)
         source_path = shlex.quote(source_dir)
 
+        # An agent workspace can hold 748 MB across 6,011 entries (benchmark dumps and
+        # sample JSON beside a small deliverable), which 120 s of tar does not cover.
+        # What an agent leaves in its workspace is not bounded by anything we control,
+        # so this budget is generous rather than tuned: a failed collection discards an
+        # entire build, while waiting costs only wall clock on a step that runs once per run.
         result = await self.exec(
             f"tar czf {env_tar_path} {exclude_flags} -C {source_path} .",
-            timeout_sec=120,
+            timeout_sec=1800,
             user="root",
         )
         if result.return_code != 0:
@@ -714,7 +746,7 @@ class BaseEnvironment(ABC):
             )
 
             with tarfile.open(host_tar_path, "r:gz") as tf:
-                tf.extractall(path=target, filter="data")
+                tf.extractall(path=target, filter=_drop_special_files)
 
     @abstractmethod
     async def exec(
@@ -843,3 +875,81 @@ class BaseEnvironment(ABC):
     async def attach(self) -> None:
         """Attaches to the environment using os.execvp."""
         raise NotImplementedError("This environment does not support attaching.")
+
+    def endpoint(self, container_port: int) -> str:
+        """Return a host-reachable URL for a port exposed by the main container.
+
+        Environments that can surface a container service to the host should
+        override this to return e.g. ``http://<ip>:<container_port>``. The
+        default raises because not every environment can expose container
+        ports to the host.
+        """
+        raise NotImplementedError("this environment does not support endpoint()")
+
+    def commit_checkpoint(
+        self, tag: str, entrypoint: list[str] | None = None
+    ) -> object:
+        """Snapshot the running environment to a reusable checkpoint named ``tag``.
+
+        Environments backed by a mutable container/VM can override this to persist
+        current state, optionally baking in an ENTRYPOINT. Gated by the
+        ``can_commit`` capability; the default raises.
+
+        Returns an opaque, backend-specific image handle the same backend's
+        ``launch`` can consume: Docker returns the image tag (``str``); Modal
+        returns a ``modal.Image``. Callers treat it as opaque and hand it back
+        unchanged.
+        """
+        if not self.capabilities.can_commit:
+            raise ValueError(
+                f"{self.type()} environment cannot commit a checkpoint (can_commit=False)."
+            )
+        raise NotImplementedError(
+            "this environment declares can_commit but does not override commit_checkpoint()"
+        )
+
+    @property
+    def is_prebuilt(self) -> bool:
+        """True when this env was constructed from a LaunchSpec (a prebuilt image,
+        no on-disk build definition). Overridden by backends that support launch()."""
+        return False
+
+    @classmethod
+    def launch(cls, spec: "LaunchSpec") -> "BaseEnvironment":
+        """Construct an environment that runs a prebuilt image (no task definition).
+
+        Backends that support running a prebuilt image override this; the default
+        rejects clearly so unsupported backends fail loud rather than silently.
+        """
+        raise NotImplementedError(
+            f"{cls.type()} environment does not support launch() from a LaunchSpec yet."
+        )
+
+    def _validate_launch_capabilities(self, spec: "LaunchSpec") -> None:
+        """Fail loud when a LaunchSpec requests a feature this backend lacks."""
+        caps = self.capabilities
+        if spec.serve_command is not None and not caps.serves:
+            raise ValueError(f"{self.type()} cannot expose a service (serves=False).")
+        if spec.gpu_device_ids and not caps.gpu_pinning:
+            raise ValueError(
+                f"{self.type()} cannot pin GPU device IDs (gpu_pinning=False)."
+            )
+        if not spec.allow_internet and not caps.disable_internet:
+            raise ValueError(
+                f"{self.type()} cannot disable internet (disable_internet=False)."
+            )
+        if (
+            spec.outbound_cidr_allowlist
+            or spec.outbound_domain_allowlist
+            or spec.egress_gateway
+            or spec.seal_command_prefix
+        ) and not caps.egress_allowlist:
+            raise ValueError(
+                f"{self.type()} cannot enforce an egress allowlist "
+                "(egress_allowlist=False)."
+            )
+        if (spec.overlay_dir or spec.lower_overlay_dirs) and not caps.overlay_dirs:
+            raise ValueError(
+                f"{self.type()} cannot give a container host directories as its "
+                "writable and read-only layers (overlay_dirs=False)."
+            )

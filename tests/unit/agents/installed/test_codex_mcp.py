@@ -78,14 +78,16 @@ class TestCreateRunAgentCommandsMCP:
     """Test that run() handles MCP servers correctly."""
 
     @pytest.mark.asyncio
-    async def test_no_mcp_servers_no_config_toml(self, temp_dir, monkeypatch):
+    async def test_no_mcp_servers_writes_no_registration(self, temp_dir, monkeypatch):
+        """config.toml is always written (it carries the web_search setting), but
+        with no servers declared nothing registers an MCP block."""
         monkeypatch.setenv("CODEX_FORCE_API_KEY", "1")
         agent = Codex(logs_dir=temp_dir, model_name="openai/o3")
         mock_env = AsyncMock()
         mock_env.exec.return_value = AsyncMock(return_code=0, stdout="", stderr="")
         await agent.run("do something", mock_env, AsyncMock())
         commands = _find_exec_commands(mock_env)
-        assert not any("config.toml" in cmd for cmd in commands)
+        assert not any("mcp_servers" in cmd for cmd in commands)
 
     @pytest.mark.asyncio
     async def test_mcp_servers_writes_config_toml(self, temp_dir, monkeypatch):
@@ -100,6 +102,6 @@ class TestCreateRunAgentCommandsMCP:
         mock_env.exec.return_value = AsyncMock(return_code=0, stdout="", stderr="")
         await agent.run("do something", mock_env, AsyncMock())
         commands = _find_exec_commands(mock_env)
-        setup_cmds = [cmd for cmd in commands if "config.toml" in cmd]
+        setup_cmds = [cmd for cmd in commands if "mcp_servers" in cmd]
         assert len(setup_cmds) == 1
-        assert "mcp_servers" in setup_cmds[0]
+        assert "config.toml" in setup_cmds[0]

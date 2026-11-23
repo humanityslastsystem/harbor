@@ -215,5 +215,5 @@ class TestCodexRunAuth:
 
         assert any(env and env.get("CODEX_HOME") == "/tmp/codex-home" for env in envs)
         assert "CODEX_HOME=/logs/agent" not in commands
-        assert 'cp -R "$CODEX_HOME/sessions" /logs/agent/sessions' in commands
+        assert 'ln -sfn /logs/agent/sessions "$CODEX_HOME/sessions"' in commands
         assert 'rm -rf /tmp/codex-secrets "$CODEX_HOME"' in commands

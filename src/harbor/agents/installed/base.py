@@ -1,6 +1,7 @@
 import functools
 import os
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar, Literal
@@ -14,7 +15,10 @@ from harbor.utils.templating import render_prompt_template
 class NonZeroAgentExitCodeError(RuntimeError):
     """Raised when the agent process exits with a non-zero exit code."""
 
-    pass
+    def __init__(self, message: str, return_code: int | None = None) -> None:
+        super().__init__(message)
+        #: The command's exit status, or None where the raiser did not record one.
+        self.return_code = return_code
 
 
 _F = Any  # Use Any to keep the decorator signature-transparent to type checkers
@@ -148,8 +152,14 @@ class BaseInstalledAgent(BaseAgent, ABC):
         version: str | None = None,
         extra_env: dict[str, str] | None = None,
         *args,
+        cut_output: Callable[[str, int], str] | None = None,
         **kwargs,
     ):
+        # How a failed command's output is cut to its first characters for an error or a
+        # log: the caller's rule, given the text and the most characters to keep (hls backs
+        # the cut off so no secret it gave in extra_env is left cut through); None cuts at
+        # that many characters.
+        self._cut_output = cut_output
         # Auto-extract kwargs matching CLI_FLAGS and ENV_VARS descriptors
         self._flag_kwargs: dict[str, Any] = {}
         for descriptor in [*self.CLI_FLAGS, *self.ENV_VARS]:
@@ -269,7 +279,12 @@ class BaseInstalledAgent(BaseAgent, ABC):
         if not text:
             return "None"
         if len(text) > max_len:
-            return text[:max_len] + " ... [truncated]"
+            head = (
+                self._cut_output(text, max_len)
+                if self._cut_output is not None
+                else text[:max_len]
+            )
+            return head + " ... [truncated]"
         return text
 
     async def _exec(
@@ -290,12 +305,11 @@ class BaseInstalledAgent(BaseAgent, ABC):
             merged_env = dict(env) if env else {}
             merged_env.update(self._extra_env)
 
+        # The environment is not logged: it holds the agent's extra_env, its route's
+        # credential among them, and a handler at DEBUG would write it out.
         self.logger.debug(
             f"Running command: {command}",
-            extra={
-                "user": str(user),
-                "env": merged_env or {},
-            },
+            extra={"user": str(user)},
         )
 
         result = await environment.exec(
@@ -317,7 +331,8 @@ class BaseInstalledAgent(BaseAgent, ABC):
             raise NonZeroAgentExitCodeError(
                 f"Command failed (exit {result.return_code}): {command}\n"
                 f"stdout: {self._truncate_output(result.stdout)}\n"
-                f"stderr: {self._truncate_output(result.stderr)}"
+                f"stderr: {self._truncate_output(result.stderr)}",
+                return_code=result.return_code,
             )
 
         self.logger.debug(

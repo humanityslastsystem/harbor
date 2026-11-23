@@ -313,3 +313,45 @@ def test_move_dir_contents_moves_contents_and_leaves_source_empty(
     assert not any(src.iterdir())
     assert (dst / "file.txt").read_text() == "ok"
     assert (dst / "nested" / "value.txt").read_text() == "nested"
+
+
+def test_workspace_download_drops_special_files_instead_of_failing(tmp_path):
+    """A FIFO in the agent's workspace must not discard the whole collection.
+
+    tarfile's ``data`` filter raises SpecialFileError on a FIFO, socket or device node
+    rather than skipping it, and one raise loses a finished build: source and artifact
+    image both. A 12-hour agent that left a named pipe in a benchmark directory hit
+    exactly this.
+    """
+    import os
+    import tarfile
+
+    from harbor.environments.base import _drop_special_files
+
+    ws = tmp_path / "ws"
+    (ws / "bench").mkdir(parents=True)
+    (ws / "server.py").write_text("print('hi')\n")
+    os.mkfifo(ws / "bench" / "fifo")
+    (ws / "bench" / "load_test.py").write_text("x = 1\n")
+
+    archive = tmp_path / "t.tgz"
+    with tarfile.open(archive, "w:gz") as tf:
+        tf.add(ws, arcname=".")
+
+    # The stock filter refuses the whole archive.
+    strict = tmp_path / "strict"
+    strict.mkdir()
+    with pytest.raises(tarfile.SpecialFileError):
+        with tarfile.open(archive) as tf:
+            tf.extractall(path=strict, filter="data")
+
+    # Ours keeps every regular file and drops the pipe.
+    out = tmp_path / "out"
+    out.mkdir()
+    with tarfile.open(archive) as tf:
+        tf.extractall(path=out, filter=_drop_special_files)
+    assert sorted(str(f.relative_to(out)) for f in out.rglob("*") if f.is_file()) == [
+        "bench/load_test.py",
+        "server.py",
+    ]
+    assert not (out / "bench" / "fifo").exists()

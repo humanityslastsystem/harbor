@@ -23,7 +23,12 @@ from harbor.models.trajectories import (
 )
 from harbor.models.trial.paths import EnvironmentPaths
 from harbor.utils.env import parse_bool_env_value
+from harbor.utils.jsonl import json_objects
 from harbor.utils.trajectory_utils import format_trajectory_json
+
+# The bytes of a session file line the readers parse; a longer one is skipped. The
+# longest measured held 143 KB; the rest is room for an image read.
+_SESSION_LINE_BYTES = 4 << 20
 
 
 class Codex(BaseInstalledAgent):
@@ -35,6 +40,40 @@ class Codex(BaseInstalledAgent):
     _OUTPUT_FILENAME = "codex.txt"
     _REMOTE_CODEX_HOME = PurePosixPath("/tmp/codex-home")
     _REMOTE_CODEX_SECRETS_DIR = PurePosixPath("/tmp/codex-secrets")
+    #: The brief the agent reads, in its WORKING DIRECTORY -- same contract as the
+    #: claude-code adapter, so both harnesses see the task the same way. Never argv: a
+    #: brief that names server.py would make the agent's own `pkill -f server.py` match
+    #: the harness process.
+    _WORKSPACE_DIR = "/workspace"
+    _WORKSPACE_BRIEF_PATH = "/workspace/BRIEF.md"
+    #: Persisted copy (a mount -> lands in the rollout record), produced by `cp` so the
+    #: recorded bytes are the bytes the agent was given.
+    _BRIEF_PATH = "/logs/agent/brief.md"
+    #: Prompt for the resume that drives the run. Deliberately minimal: the thread
+    #: already carries the brief, the goal and everything done so far, so this only has
+    #: to hand control back. The GOAL is what keeps the agent working -- codex will not
+    #: signal task_complete while one is outstanding -- not this text.
+    _RESUME_PROMPT = "Continue working toward the goal."
+    #: Mode of codex's hosted web search tool for every run. Codex offers the tool
+    #: unless told otherwise (codex 0.146.0 under the sandbox bypass below sends it with
+    #: live web access). The search runs on the model provider's side, so no egress
+    #: rule in the sandbox sees it, and an agent whose brief says it is offline could
+    #: still search the web. Set twice: as a key of the config.toml harbor writes, so
+    #: the recorded config shows it, and as a `-c` override on both codex calls,
+    #: because a `.codex/config.toml` in the agent's working directory takes precedence
+    #: over $CODEX_HOME's and the agent can write one.
+    _WEB_SEARCH_MODE = "disabled"
+    #: The model provider block written into config.toml when a base URL is set. The
+    #: shell puts the URL where ``{base_url}`` is (see _build_provider_config_command).
+    _PROVIDER_TOML = (
+        '\nmodel_provider = "custom"\n'
+        "\n"
+        "[model_providers.custom]\n"
+        'name = "custom"\n'
+        'base_url = "{base_url}"\n'
+        'wire_api = "responses"\n'
+        "requires_openai_auth = true\n"
+    )
 
     CLI_FLAGS = [
         CliFlag(
@@ -57,6 +96,21 @@ class Codex(BaseInstalledAgent):
     def name() -> str:
         return AgentName.CODEX.value
 
+    def __init__(
+        self, logs_dir: Path, *args, goal_kickoff: str | None = None, **kwargs
+    ):
+        # The instruction that asks the model to call its `create_goal` tool. Codex's
+        # goal machinery is what keeps a long run alive: with a goal outstanding the
+        # agent cannot signal task_complete (it emits turn_aborted instead), and
+        # `codex exec resume` is driven turn after turn until the goal is met. Without
+        # one, `codex exec` runs a single turn and exits -- measured.
+        #
+        # It must be phrased as a REQUEST, not as a slash command: `/goal ...` is
+        # interpreted by interactive clients (TUI/app) and never reaches the model, so
+        # passing it as prompt text is silently inert.
+        self._goal_kickoff = goal_kickoff
+        super().__init__(logs_dir, *args, **kwargs)
+
     @property
     def _trajectory_path(self) -> PurePosixPath:
         return PurePosixPath(EnvironmentPaths.agent_dir / "trajectory.json")
@@ -73,6 +127,25 @@ class Codex(BaseInstalledAgent):
         return text
 
     async def install(self, environment: BaseEnvironment) -> None:
+        # Already baked into the image? Then do NOTHING. An air-gapped sandbox bakes both
+        # CLIs precisely because its build seal blocks the npm registry and
+        # raw.githubusercontent.com; attempting the install below turns a working
+        # environment into a hard failure at agent setup.
+        #
+        # Same shape as ClaudeCode's probe: ``exec_as_agent`` RAISES on a nonzero exit
+        # rather than returning a status, so "not found" lands in the except and falls
+        # through to install. Skipped when a version is pinned -- an explicit pin means
+        # install THAT version rather than accept whatever is present.
+        if self._version is None:
+            try:
+                await self.exec_as_agent(
+                    environment,
+                    command='export PATH="$HOME/.local/bin:$PATH"; command -v codex',
+                )
+                self.logger.debug("codex already present (baked); skipping install")
+                return
+            except RuntimeError:
+                pass  # codex not present -> install it below
         # Install system packages (root)
         await self.exec_as_root(
             environment,
@@ -160,7 +233,7 @@ class Codex(BaseInstalledAgent):
         if isinstance(raw, str):
             try:
                 parsed = json.loads(raw)
-            except json.JSONDecodeError:
+            except Exception:  # noqa: BLE001 -- the agent's commands wrote the output
                 return raw, None
         else:
             parsed = raw
@@ -326,6 +399,48 @@ class Codex(BaseInstalledAgent):
             + output * output_rate
         )
 
+    @staticmethod
+    def _is_subagent_session(session_file: Path) -> bool:
+        """Whether a session file records a spawned subagent rather than the root run.
+
+        Codex writes one file per thread into the same directory, so a run that spawns
+        subagents leaves several. A spawned thread's ``session_meta`` carries the parent
+        it forked from; the root run's does not.
+        """
+        for event in json_objects(session_file, max_line_bytes=_SESSION_LINE_BYTES):
+            if event.get("type") != "session_meta":
+                continue
+            payload = event.get("payload")
+            if not isinstance(payload, dict):
+                return False
+            return bool(
+                payload.get("forked_from_id")
+                or payload.get("parent_thread_id")
+                or payload.get("thread_source") == "subagent"
+            )
+        return False
+
+    def _select_session_file(self, session_files: list[Path]) -> Path:
+        """Pick the root run's session file from every thread the run wrote.
+
+        Selecting by directory order or by name would both be wrong: subagent files sort
+        arbitrarily under the former and, being created later, sort last under the latter.
+        Reading a subagent's file silently reports that thread's steps and token usage as
+        the whole run's.
+        """
+        roots = [f for f in session_files if not self._is_subagent_session(f)]
+        if len(roots) == 1:
+            return roots[0]
+
+        fallback = max(session_files, key=lambda f: f.stat().st_size)
+        self.logger.warning(
+            f"Expected exactly 1 root Codex session in {session_files[0].parent}, "
+            f"found {len(roots)} among {len(session_files)} files; "
+            f"falling back to the largest, {fallback.name}. "
+            "Reported steps and token usage may cover only part of the run."
+        )
+        return fallback
+
     def _convert_events_to_trajectory(self, session_dir: Path) -> Trajectory | None:
         """Convert Codex session JSONL events into an ATIF trajectory."""
         session_files = list(session_dir.glob("*.jsonl"))
@@ -334,20 +449,13 @@ class Codex(BaseInstalledAgent):
             self.logger.debug(f"No Codex session files found in {session_dir}")
             return None
 
-        session_file = session_files[0]
+        session_file = self._select_session_file(session_files)
 
-        raw_events: list[dict[str, Any]] = []
-        with open(session_file, "r") as handle:
-            for line in handle:
-                stripped = line.strip()
-                if not stripped:
-                    continue
-                try:
-                    raw_events.append(json.loads(stripped))
-                except json.JSONDecodeError as exc:
-                    self.logger.debug(
-                        f"Skipping malformed JSONL line in {session_file}: {exc}"
-                    )
+        raw_events = list(
+            json_objects(
+                session_file, max_line_bytes=_SESSION_LINE_BYTES, logger=self.logger
+            )
+        )
 
         if not raw_events:
             return None
@@ -474,7 +582,7 @@ class Codex(BaseInstalledAgent):
                 raw_arguments = payload.get(raw_args_key)
                 try:
                     parsed_args = json.loads(raw_arguments)
-                except (json.JSONDecodeError, TypeError):
+                except Exception:  # noqa: BLE001 -- the model wrote the arguments
                     if isinstance(raw_arguments, str):
                         parsed_args = {"input": raw_arguments}
                     elif raw_arguments is None:
@@ -613,7 +721,12 @@ class Codex(BaseInstalledAgent):
         Converts the Codex session JSONL file into an ATIF trajectory, persists it,
         and propagates usage metrics back to the Harbor context.
         """
-        session_dir = self._get_session_dir()
+        try:
+            session_dir = self._get_session_dir()
+        except ValueError as exc:
+            # The agent's commands can make directories among its sessions.
+            self.logger.warning(f"No single Codex session directory: {exc}")
+            return
         if not session_dir:
             self.logger.debug("No Codex session directory found")
             return
@@ -628,7 +741,7 @@ class Codex(BaseInstalledAgent):
             self.logger.debug("Failed to convert Codex session to trajectory")
             return
 
-        trajectory_path = self.logs_dir / "trajectory.json"
+        trajectory_path = (self.trajectory_dir or self.logs_dir) / "trajectory.json"
         try:
             with open(trajectory_path, "w") as handle:
                 handle.write(format_trajectory_json(trajectory.to_json_dict()))
@@ -670,6 +783,48 @@ class Codex(BaseInstalledAgent):
             lines.append("")
         escaped_config = shlex.quote("\n".join(lines))
         return f'echo {escaped_config} >> "$CODEX_HOME/config.toml"'
+
+    def _build_provider_config_command(self) -> str | None:
+        """Return a shell command that appends the model provider block to
+        $CODEX_HOME/config.toml, or None when no base URL is set.
+
+        A custom endpoint must be declared as a full model PROVIDER, not via the
+        legacy `openai_base_url` key. That key was enough on codex 0.118.0, but by
+        0.146 the Responses transport is a websocket (`codex_api::endpoint::
+        responses_websocket`) which ignores it and dials wss://api.openai.com
+        regardless -- inside a sealed sandbox that surfaces as "Connection reset by
+        peer" against a host the egress allowlist never admitted, which reads like a
+        network fault rather than a misconfiguration.
+
+        `requires_openai_auth = true` makes the provider use the OpenAI credential
+        (auth.json / OPENAI_API_KEY). `wire_api = "responses"` is the only supported
+        value and is also the default; stated explicitly so a future default change
+        cannot silently switch the transport.
+
+        The base URL is a secret like the credential, so it is never part of the
+        command: the shell expands ``$OPENAI_BASE_URL`` from the exec's environment,
+        as the auth file's credential is, and the command fails when that holds none.
+        A command's text is logged (at debug here, by an exec server, in a failed
+        command's error) where its environment is not.
+
+        Run as its own exec with `printf`, NOT as a heredoc concatenated onto the auth
+        command. The heredoc form is fragile here -- it is appended after another
+        `<<EOF` block and terminated by a `TOML` line with no trailing newline -- and
+        when it silently fails to land the only symptom is codex dialling
+        api.openai.com and dying on the egress seal, which reads as a network fault.
+        The `grep -q` makes a failed write loud instead: exec_as_agent raises on a
+        nonzero exit.
+        """
+        if not self._get_env("OPENAI_BASE_URL"):
+            return None
+        head, tail = self._PROVIDER_TOML.split("{base_url}")
+        # The block is printf's argument, never its format, so a % or a \ in it stays.
+        return (
+            f"printf '%s' {shlex.quote(head)} "
+            f'"${{OPENAI_BASE_URL:?}}" {shlex.quote(tail)} '
+            '>> "$CODEX_HOME/config.toml" '
+            '&& grep -q "^\\[model_providers.custom\\]" "$CODEX_HOME/config.toml"'
+        )
 
     def _resolve_auth_json_path(self) -> Path | None:
         """Resolve which auth.json to inject, if any.
@@ -730,11 +885,22 @@ class Codex(BaseInstalledAgent):
             "CODEX_HOME": remote_codex_home,
         }
 
+        # $CODEX_HOME/sessions is a SYMLINK into the agent log dir, so codex writes its
+        # session rollouts straight into the mount the host live-syncs -- that is what
+        # makes an in-progress build followable. Kept in $CODEX_HOME (not moved) so the
+        # teardown below still unlinks it; `rm -rf` removes the link, never the target.
+        #
+        # Without this the rollouts sit in /tmp for the whole run and are copied out
+        # only at teardown, so a 12h build renders nothing until it is over -- the
+        # window in which watching it is worth anything.
+        sessions_dest = (EnvironmentPaths.agent_dir / "sessions").as_posix()
         await self.exec_as_agent(
             environment,
             command=(
                 f'mkdir -p "$CODEX_HOME" {shlex.quote(remote_secrets_dir)} '
-                f"{shlex.quote(EnvironmentPaths.agent_dir.as_posix())}"
+                f"{shlex.quote(EnvironmentPaths.agent_dir.as_posix())} "
+                f"{shlex.quote(sessions_dest)} "
+                f'&& ln -sfn {shlex.quote(sessions_dest)} "$CODEX_HOME/sessions"'
             ),
             env=env,
         )
@@ -761,19 +927,43 @@ class Codex(BaseInstalledAgent):
                 '"$CODEX_HOME/auth.json"\n'
             )
 
+        # The base config is the first write, and it truncates the file. A later block
+        # appends, and TOML reads a bare key that follows a table header as a key of
+        # that table, so top-level keys have to come before the provider and MCP
+        # tables. Truncating also means a setup that runs again into the same
+        # $CODEX_HOME rebuilds the same file instead of repeating keys, which codex
+        # refuses to load. Read back like the other blocks, so a write that does not
+        # land fails setup.
+        web_search = f"web_search = {json.dumps(self._WEB_SEARCH_MODE)}"
+        await self.exec_as_agent(
+            environment,
+            command=(
+                f"printf '%s\\n' {shlex.quote(web_search)} "
+                '> "$CODEX_HOME/config.toml" '
+                f'&& grep -qxF {shlex.quote(web_search)} "$CODEX_HOME/config.toml"'
+            ),
+            env=env,
+        )
+
         if openai_base_url := self._get_env("OPENAI_BASE_URL"):
             env["OPENAI_BASE_URL"] = openai_base_url
 
-        # codex 0.118.0 only honors openai_base_url from config.toml, not the env var.
-        config_toml_block = ""
-        if openai_base_url:
-            config_toml_block = (
-                '\ncat >>"$CODEX_HOME/config.toml" <<TOML\n'
-                'openai_base_url = "${OPENAI_BASE_URL}"\n'
-                "TOML"
+        provider_command = self._build_provider_config_command()
+        if provider_command:
+            await self.exec_as_agent(environment, command=provider_command, env=env)
+            # Snapshot the EFFECTIVE config into the rollout record. Which endpoint codex
+            # actually dials is otherwise invisible after the sandbox is gone, and a
+            # provider block that fails to take effect looks identical to a network
+            # fault ("Connection reset by peer" against a host the seal never admitted).
+            await self.exec_as_agent(
+                environment,
+                command=(
+                    f"mkdir -p {shlex.quote(EnvironmentPaths.agent_dir.as_posix())} && "
+                    f'cp "$CODEX_HOME/config.toml" '
+                    f"{shlex.quote((EnvironmentPaths.agent_dir / 'codex-config.toml').as_posix())}"
+                ),
+                env=env,
             )
-
-        setup_command += config_toml_block
 
         skills_command = self._build_register_skills_command()
         if skills_command:
@@ -789,23 +979,116 @@ class Codex(BaseInstalledAgent):
                 command=setup_command,
                 env=env,
             )
+        # The brief goes to the agent's WORKING DIRECTORY as a file (plus a byte-identical
+        # `cp` to the persisted path), never argv -- same contract as the claude-code
+        # adapter. What rides the command line is only the short kickoff that names it.
+        await self.exec_as_agent(
+            environment,
+            command=(
+                f"mkdir -p /logs/agent {self._WORKSPACE_DIR} "
+                f"&& printf '%s' {escaped_instruction} > {self._WORKSPACE_BRIEF_PATH} "
+                f"&& cp {self._WORKSPACE_BRIEF_PATH} {self._BRIEF_PATH}"
+            ),
+            env=env,
+        )
+
+        nvm = "if [ -s ~/.nvm/nvm.sh ]; then . ~/.nvm/nvm.sh; fi; "
+        out = EnvironmentPaths.agent_dir / self._OUTPUT_FILENAME
+        # Codex's own sandboxing buys nothing inside a container and costs correctness: its
+        # bubblewrap helper cannot pivot_root there, so every shell command and apply_patch
+        # fails with "bwrap: Can't bind mount /oldroot/ on /newroot/: Invalid argument".
+        # Both calls therefore bypass it: bypassing on call 1 alone leaves the drive
+        # sandboxed and failing. Disabling the sandbox by feature flag instead does NOT
+        # work, and `use_legacy_landlock` is deprecated in 0.146.0 and injects an error
+        # item into every turn.
+        #
+        # `--ignore-rules` drops user and project execpolicy `.rules` files on top. Codex's
+        # built-in rules are compiled into the binary and stay in force regardless --
+        # `rm -f` is refused by one of them.
+        unsandboxed = (
+            "--dangerously-bypass-approvals-and-sandbox "
+            "--skip-git-repo-check "
+            "--ignore-rules "
+        )
+        # Both calls carry it; see _WEB_SEARCH_MODE for why the config key is not enough.
+        no_web_search = (
+            f"-c {shlex.quote(f'web_search={json.dumps(self._WEB_SEARCH_MODE)}')} "
+        )
+        # Without a kickoff the prompt IS the brief text.
+        opening = (
+            shlex.quote(self._goal_kickoff)
+            if self._goal_kickoff
+            else escaped_instruction
+        )
         try:
+            # Call 1 -- establish the goal and take a first pass. With a goal outstanding
+            # codex will NOT emit task_complete; it ends the turn as turn_aborted and the
+            # process exits, which is why the second call is required rather than optional.
             await self.exec_as_agent(
                 environment,
                 command=(
-                    "if [ -s ~/.nvm/nvm.sh ]; then . ~/.nvm/nvm.sh; fi; "
-                    "codex exec "
-                    "--dangerously-bypass-approvals-and-sandbox "
-                    "--skip-git-repo-check "
+                    f"{nvm}codex exec "
+                    f"{unsandboxed}"
                     f"--model {model} "
                     "--json "
                     "--enable unified_exec "
                     f"{cli_flags_arg}"
+                    f"{no_web_search}"
                     "-- "  # end of flags
-                    f"{escaped_instruction} "
-                    f"2>&1 </dev/null | tee {
-                        EnvironmentPaths.agent_dir / self._OUTPUT_FILENAME
-                    }"
+                    f"{opening} "
+                    f"2>&1 </dev/null | tee -a {out}"
+                ),
+                env=env,
+            )
+            if self._goal_kickoff is None:
+                return
+            # Call 2 -- the drive. `codex exec resume` on a thread with an OUTSTANDING
+            # goal runs turn after turn inside ONE process, and returns only when the
+            # goal is met or the orchestrator's wall-clock cap terminates it. This is
+            # not a retry loop: it is a single long-lived invocation, the codex analogue
+            # of claude-code's one `claude` process driven by its /goal Stop hook. If the
+            # agent judges the goal met it exits here, and that is a legitimate end.
+            #
+            # Resumed by the id call 1 opened, never `--last`. `--last` is the newest
+            # session in the directory, and a model that spawns sub-agents forks a
+            # thread per sub-agent, each newer than the one that spawned it. Resuming a
+            # fork either fails outright ("direct app-server input is not allowed for
+            # multi-agent v2 sub-agents") or lands in a sub-agent's environment, and
+            # both cost the whole build.
+            #
+            # `resume` takes a slightly different flag set than `exec` -- it rejects
+            # `--sandbox` -- so its command is built separately. It does accept the bypass
+            # and git-check flags, and must be given them: without the bypass it falls back
+            # to codex's default sandbox mode and bubblewraps every command it runs.
+            # The id is the first `thread.started` in call 1's own JSON stream, which a
+            # session emits before it can fork anything. Found in two stages -- the first
+            # line announcing a thread start, then `thread_id` anywhere on it -- because
+            # JSON field order and spacing are not guaranteed and a pattern that assumed
+            # them would fail into the `--last` fallback.
+            # A stream carrying none still falls back, and says so on stderr.
+            # The model is passed again. A resumed thread does not keep the model it was
+            # recorded with: without `--model` codex resumes on its own default and says
+            # so ("recorded with model <model> but is resuming with <default>").
+            thread_id = (
+                f"tid=$(grep -m1 'thread\\.started' {out} "
+                '| grep -o \'"thread_id"[[:space:]]*:[[:space:]]*"[^"]*"\' '
+                "| head -1 | cut -d'\"' -f4); "
+                '[ -n "$tid" ] || echo \'harbor: no thread.started in the kickoff stream; '
+                "resuming --last, which may select a sub-agent fork' >&2; "
+            )
+            await self.exec_as_agent(
+                environment,
+                command=(
+                    f"{nvm}{thread_id}"
+                    'codex exec resume "${tid:---last}" '
+                    f"--model {model} "
+                    "--json "
+                    f"{unsandboxed}"
+                    f"{cli_flags_arg}"
+                    f"{no_web_search}"
+                    "-- "
+                    f"{shlex.quote(self._RESUME_PROMPT)} "
+                    f"2>&1 </dev/null | tee -a {out}"
                 ),
                 env=env,
             )
@@ -813,17 +1096,10 @@ class Codex(BaseInstalledAgent):
             try:
                 await self.exec_as_agent(
                     environment,
-                    command=(
-                        f"mkdir -p {EnvironmentPaths.agent_dir.as_posix()}\n"
-                        'if [ -d "$CODEX_HOME/sessions" ]; then\n'
-                        f"  rm -rf {
-                            (EnvironmentPaths.agent_dir / 'sessions').as_posix()
-                        }\n"
-                        f'  cp -R "$CODEX_HOME/sessions" {
-                            (EnvironmentPaths.agent_dir / "sessions").as_posix()
-                        }\n'
-                        "fi"
-                    ),
+                    # sessions are written through the symlink directly into the
+                    # agent dir, so there is nothing to copy -- just make sure the
+                    # directory exists for a run that produced no session at all.
+                    command=f"mkdir -p {shlex.quote(sessions_dest)}",
                     env=env,
                 )
             except Exception:

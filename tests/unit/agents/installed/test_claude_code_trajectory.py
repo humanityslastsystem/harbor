@@ -302,3 +302,49 @@ class TestClaudeCodeSessionSelection:
         (projects_dir / "-root" / "session-1" / "session.jsonl").write_text("{}\n")
 
         assert agent._get_session_dir() is None
+
+
+class TestStepIdNumberingSurvivesDroppedEvents:
+    """ATIF requires step_id sequential from 1, and the converter drops events it cannot
+    turn into steps -- a tool-call entry whose `tool_use` never arrived reaches the loop
+    with an empty tool name and raises. Numbering by position in the input would leave a
+    hole at each drop, so the whole Trajectory would fail validation and the run would lose
+    its trajectory, its cost and its step count, silently."""
+
+    def test_a_dropped_event_does_not_void_the_trajectory(self, tmp_path, monkeypatch):
+        events = [
+            _make_assistant_event([{"type": "text", "text": f"m{i}"}]) for i in range(4)
+        ]
+        session_dir = _write_session(tmp_path, events)
+        agent = ClaudeCode(logs_dir=tmp_path, model_name="m")
+
+        # Drop the second event the way an unconvertible one is dropped in production.
+        original = agent._convert_event_to_step
+        seen = {"n": 0}
+
+        def drop_the_second(event, step_id):
+            seen["n"] += 1
+            if seen["n"] == 2:
+                raise ValueError("Tool call event missing call_id or tool_name")
+            return original(event, step_id)
+
+        monkeypatch.setattr(agent, "_convert_event_to_step", drop_the_second)
+        trajectory = agent._convert_events_to_trajectory(session_dir)
+
+        assert trajectory is not None, "a dropped event must not void the trajectory"
+        assert [s.step_id for s in trajectory.steps] == list(
+            range(1, len(trajectory.steps) + 1)
+        ), "step ids must stay sequential from 1 across a dropped event"
+
+    def test_ids_are_sequential_when_every_event_converts(self, tmp_path):
+        events = [
+            _make_assistant_event([{"type": "text", "text": f"m{i}"}]) for i in range(4)
+        ]
+        session_dir = _write_session(tmp_path, events)
+        agent = ClaudeCode(logs_dir=tmp_path, model_name="m")
+
+        trajectory = agent._convert_events_to_trajectory(session_dir)
+
+        assert [s.step_id for s in trajectory.steps] == list(
+            range(1, len(trajectory.steps) + 1)
+        )

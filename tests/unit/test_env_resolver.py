@@ -1,3 +1,4 @@
+import json
 import os
 
 import pytest
@@ -5,6 +6,7 @@ import pytest
 from harbor.utils.env import (
     get_required_host_vars,
     parse_bool_env_value,
+    redact_sensitive_mapping,
     resolve_env_vars,
 )
 
@@ -212,3 +214,70 @@ class TestGetRequiredHostVars:
         env_dict = {"A": "${VAR:-}"}
         result = get_required_host_vars(env_dict)
         assert result == [("VAR", "")]
+
+
+class TestRedactSensitiveMapping:
+    def test_sensitive_values_redacted_and_others_kept(self):
+        result = redact_sensitive_mapping(
+            {"api_key": "sk-live-9f3a1c7e2b8d4a60", "max_retries": 3}
+        )
+        assert result == {"api_key": "sk-l****a60", "max_retries": 3}
+
+    def test_nested_dict_is_walked(self):
+        result = redact_sensitive_mapping(
+            {"extra_headers": {"Authorization": "Bearer cb-tok-51de9a44c07b2f83"}}
+        )
+        assert result == {"extra_headers": {"Authorization": "Bear****f83"}}
+
+    def test_nested_list_is_walked(self):
+        result = redact_sensitive_mapping(
+            {"providers": [{"name": "gateway", "token": "cb-tok-51de9a44c07b2f83"}]}
+        )
+        assert result == {"providers": [{"name": "gateway", "token": "cb-t****f83"}]}
+
+    def test_sensitive_key_holding_a_structure_is_redacted_whole(self):
+        result = redact_sensitive_mapping(
+            {"vertex_credentials": {"private_key": "-----BEGIN PRIVATE KEY-----"}}
+        )
+        assert result == {"vertex_credentials": "****"}
+
+    def test_non_string_keys_do_not_raise(self):
+        # kwargs bags are arbitrary Python, and the dump must not fail on a payload it
+        # would otherwise have recorded.
+        assert redact_sensitive_mapping({"ids": {1: "one"}}) == {"ids": {1: "one"}}
+
+    def test_input_is_not_mutated(self):
+        original = {"api_key": "sk-live-9f3a1c7e2b8d4a60"}
+        redact_sensitive_mapping(original)
+        assert original == {"api_key": "sk-live-9f3a1c7e2b8d4a60"}
+
+    def test_numbers_under_a_sensitive_key_stay_readable(self):
+        # The pattern that flags a credential also flags counters, and a number is
+        # never a credential.
+        result = redact_sensitive_mapping({"max_tokens": 4096, "total_tokens": 30})
+        assert result == {"max_tokens": 4096, "total_tokens": 30}
+
+    def test_tuples_keep_their_container_type(self):
+        result = redact_sensitive_mapping({"stop": ("</s>", "\n\n")})
+        assert result == {"stop": ("</s>", "\n\n")}
+
+    def test_tuple_nested_in_a_dict_keeps_its_container_type(self):
+        result = redact_sensitive_mapping({"extra_body": {"stop": ("</s>",)}})
+        assert result == {"extra_body": {"stop": ("</s>",)}}
+
+    def test_a_cycle_is_cut_rather_than_followed(self):
+        bag: dict = {"api_key": "sk-live-9f3a1c7e2b8d4a60", "nested": {}}
+        bag["nested"]["self"] = bag
+
+        result = redact_sensitive_mapping(bag)
+
+        assert result["api_key"] == "sk-l****a60"
+        # The copy terminates, so it can be serialized.
+        assert json.dumps(result)
+
+    def test_deep_nesting_does_not_raise(self):
+        bag: dict = {"leaf": "value"}
+        for _ in range(5_000):
+            bag = {"nested": bag}
+
+        assert redact_sensitive_mapping(bag)

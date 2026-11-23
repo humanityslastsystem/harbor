@@ -1,5 +1,6 @@
 import os
 import re
+from typing import Any
 
 _TEMPLATE_PATTERN = re.compile(r"\$\{([^}:]+)(?::-(.*))?\}")
 _SENSITIVE_KEY_RE = re.compile(
@@ -7,6 +8,14 @@ _SENSITIVE_KEY_RE = re.compile(
 )
 _TRUE_BOOL_VALUES = frozenset({"true", "1", "yes"})
 _FALSE_BOOL_VALUES = frozenset({"false", "0", "no"})
+
+# A kwargs bag is arbitrary Python and may hold a reference cycle or a few thousand
+# levels of nesting, either of which exhausts the stack while being redacted. Bounding
+# the depth covers both, where tracking visited ids would only catch the cycle. Past
+# the bound the value is replaced rather than kept, because an unwalked value can
+# carry the credential the redaction exists to hide.
+_MAX_REDACTION_DEPTH = 32
+_TOO_DEEP = f"<nested more than {_MAX_REDACTION_DEPTH} levels deep>"
 
 
 def parse_bool_env_value(
@@ -53,6 +62,50 @@ def redact_sensitive_value(value: str) -> str:
     if len(value) <= 8:
         return "****"
     return value[:4] + "****" + value[-3:]
+
+
+def redact_sensitive_mapping(mapping: dict[str, Any]) -> dict[str, Any]:
+    """Copy ``mapping`` with the values under sensitive-looking keys redacted.
+
+    For kwargs bags that get persisted, where a credential sits beside values worth
+    keeping readable. The keys survive, so a reader still sees what was configured,
+    and lists and tuples keep their container type.
+
+    Nested dicts are walked: a bag holding ``extra_headers`` keeps its
+    ``Authorization`` one level down. Numbers under a sensitive key are kept as they
+    are, since a credential is a string or a structure of strings, and the pattern
+    that flags a credential also flags counters such as ``max_tokens``. Anything
+    nested past ``_MAX_REDACTION_DEPTH``, a cycle included, is replaced by a marker.
+    """
+    return _redact_mapping(mapping, _MAX_REDACTION_DEPTH)
+
+
+def _redact_mapping(mapping: dict[str, Any], depth: int) -> dict[str, Any]:
+    return {key: _redact_under_key(key, value, depth) for key, value in mapping.items()}
+
+
+def _redact_under_key(key: Any, value: Any, depth: int) -> Any:
+    if isinstance(key, str) and is_sensitive_env_key(key):
+        if isinstance(value, str):
+            return redact_sensitive_value(value)
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        # A credentials dict, or an object whose repr could carry the secret, is
+        # redacted whole rather than walked.
+        return "****"
+    return _redact_value(value, depth)
+
+
+def _redact_value(value: Any, depth: int) -> Any:
+    """Walk ``value`` for nested dicts; only a dict key can mark something sensitive."""
+    if depth <= 0:
+        return _TOO_DEEP
+    if isinstance(value, dict):
+        return _redact_mapping(value, depth - 1)
+    if isinstance(value, (list, tuple)):
+        walked = [_redact_value(item, depth - 1) for item in value]
+        return tuple(walked) if isinstance(value, tuple) else walked
+    return value
 
 
 def templatize_sensitive_env(env: dict[str, str]) -> dict[str, str]:

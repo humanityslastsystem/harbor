@@ -1,6 +1,7 @@
 """Shared pytest fixtures for harbor tests."""
 
 import asyncio
+import os
 import subprocess
 import sys
 import tempfile
@@ -8,6 +9,24 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Force Rich/Click to render plain text, no matter the host terminal.
+
+    The CLI's `rich.Console` instances decide whether to emit ANSI escape
+    codes by inspecting env vars like `FORCE_COLOR` and `TERM` at
+    construction time, not by checking whether the test's captured stream
+    is a real tty. A developer or CI runner with `FORCE_COLOR` set would
+    otherwise get colour codes injected into `CliRunner`/`capsys` output,
+    splitting substrings that tests match against and making results
+    depend on the environment the suite happens to run in. `NO_COLOR` is
+    the standard override both Rich and Click honor even when a
+    `FORCE_COLOR`-like signal is also present, so setting it here — before
+    any test module (and the `rich.Console` instances it imports) is
+    loaded — makes CLI output plain-text and deterministic everywhere.
+    """
+    os.environ["NO_COLOR"] = "1"
 
 
 @pytest.fixture(scope="session")

@@ -1,5 +1,6 @@
 import asyncio
 import asyncio.subprocess
+import json
 import os
 import re
 import shlex
@@ -8,8 +9,12 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from harbor.environments.base import BaseEnvironment, ExecResult
+
+if TYPE_CHECKING:
+    from harbor.environments.launch import EgressGatewaySpec, LaunchSpec
 from harbor.environments.capabilities import (
     EnvironmentCapabilities,
     EnvironmentResourceCapabilities,
@@ -20,7 +25,11 @@ from harbor.environments.docker import (
     COMPOSE_PREBUILT_PATH,
     COMPOSE_WINDOWS_KEEPALIVE_PATH,
     RESOURCES_COMPOSE_NAME,
+    write_command_compose_file,
+    write_egress_gateway_compose_file,
+    write_env_compose_file,
     write_mounts_compose_file,
+    write_network_compose_file,
     write_resources_compose_file,
 )
 from harbor.environments.docker.compose_env import (
@@ -78,6 +87,56 @@ class DockerEnvironment(BaseEnvironment):
     # Class-level lock per image name to prevent parallel builds of the same image.
     _image_build_locks: dict[str, asyncio.Lock] = {}
 
+    # Marks the lightweight, trial-free construction path (see ``launch``). Only
+    # that path has no on-disk Dockerfile/compose, so only that path may skip
+    # definition validation. Defaults False so the normal trial-driven
+    # ``__init__`` path always validates -- set as a class attribute so
+    # it exists when ``_validate_definition`` runs during ``super().__init__``
+    # even before the instance attribute is assigned. Exposed via ``is_prebuilt``.
+    _prebuilt: bool = False
+
+    # Selects the sealed-egress override used when ``allow_internet`` is False.
+    # The trial-driven ``__init__`` path keeps ``network_mode: none``
+    # (no network namespace at all -- unreachable by anyone), so this
+    # defaults False. Only the lightweight ``launch`` path sets it True, opting
+    # into the ``hls_internal`` internal-network override that blocks outbound
+    # internet while staying host-reachable (needed by EVAL servers). Declared as
+    # a class attribute so it exists if read during construction before the
+    # instance attribute is assigned.
+    _internal_network_when_sealed: bool = False
+
+    # Service-mode (EVAL) command override. When set to a non-None list the env
+    # writes a compose override that REPLACES the base prebuilt/build keepalive
+    # command (``sh -c sleep infinity``) with these args, so the image's own
+    # server ENTRYPOINT runs as the long-lived process. Defaults None so the
+    # trial-driven path and idle prebuilt envs keep the keepalive unchanged.
+    # Declared as a class attribute so it exists if read during construction
+    # before the instance attribute is assigned.
+    _service_command: list[str] | None = None
+
+    # Service-container environment override. When set to a non-None dict the
+    # env writes a compose override declaring ``services.main.environment`` so
+    # these vars reach the long-lived service process (the base prebuilt/build
+    # compose has no ``environment:`` block, and per-exec env doesn't apply to
+    # the service process). Defaults None so the trial-driven path and plain
+    # prebuilt envs inject nothing. Declared as a class attribute so it exists
+    # if read during construction before the instance attribute is assigned.
+    _service_env: dict[str, str] | None = None
+
+    # Specific GPU device IDs to pin (e.g. ["1", "2", "3"]) from the allocator.
+    # When set, the compose resource override uses ``device_ids`` instead of
+    # ``count``, guaranteeing the container lands on exactly those devices.
+    # Defaults None so the gpu_count path applies.
+    _gpu_device_ids: list[str] | None = None
+
+    # Egress-gateway sidecar (see ``launch``). When set, the env appends the gateway
+    # compose override: ``main`` joins the gateway's netns (``network_mode: service``)
+    # and the gateway transparently intercepts/filters all egress. Defaults None so the
+    # trial-driven path and plain prebuilt envs add no sidecar. Declared as a class
+    # attribute so it exists if read during construction before the instance attribute
+    # is set.
+    _egress_gateway: "EgressGatewaySpec | None" = None
+
     @staticmethod
     def _detect_daemon_os() -> str | None:
         """Return the Docker daemon's OSType (e.g. 'linux' or 'windows'), or None on error."""
@@ -124,6 +183,64 @@ class DockerEnvironment(BaseEnvironment):
                 "Docker daemon is not running. Please start Docker and try again."
             )
 
+    @classmethod
+    def launch(cls, spec: "LaunchSpec") -> "DockerEnvironment":
+        """Construct a DockerEnvironment that runs a prebuilt image directly.
+
+        This is the lightweight, non-trial construction path: no on-disk
+        Dockerfile/compose and no trial scaffolding are required. The image
+        itself is the environment definition. The trial-driven ``__init__``
+        path is unaffected. The spec is validated against this backend's
+        capabilities (fail loud on unsupported features) before returning.
+        """
+        import uuid
+
+        if not isinstance(spec.image, str):
+            raise ValueError(
+                "DockerEnvironment.launch requires a registry image tag (str); "
+                f"got {type(spec.image).__name__}. Image handles produced by another "
+                "backend's commit_checkpoint cannot be launched on Docker."
+            )
+
+        task_env_config = EnvironmentConfig(
+            docker_image=spec.image,
+            gpus=spec.gpus or None,
+            cpus=spec.cpus,
+            memory_mb=spec.memory_mb,
+            allow_internet=spec.allow_internet,
+            workdir=spec.workdir,
+        )
+
+        # The trial-driven path roots paths/dirs in the trial output directory.
+        # With no trial, root everything in a throwaway temp directory so the
+        # env is self-contained and never touches an on-disk task definition.
+        # The directory is intentionally not cleaned up here: callers may rely
+        # on it for the env's lifetime, and the OS reclaims temp space.
+        environment_dir = Path(tempfile.mkdtemp(prefix="hb-launch-"))
+        trial_paths = TrialPaths(trial_dir=environment_dir)
+
+        short_id = uuid.uuid4().hex[:8]
+        env = cls(
+            environment_dir=environment_dir,
+            environment_name=f"launch-{short_id}",
+            session_id=f"launch-{short_id}",
+            trial_paths=trial_paths,
+            task_env_config=task_env_config,
+            mounts=list(spec.mounts) if spec.mounts else None,
+            _prebuilt=True,
+            _internal_network_when_sealed=True,
+            _service_command=list(spec.serve_command) if spec.serve_command else None,
+            _service_env=dict(spec.env) if spec.env else None,
+            _gpu_device_ids=list(spec.gpu_device_ids) if spec.gpu_device_ids else None,
+        )
+        env._validate_launch_capabilities(spec)
+        # Store the shared eval network name so start() can connect the container.
+        env._shared_network = getattr(spec, "shared_network", None)
+        # Store the egress-gateway sidecar so start()/_docker_compose_paths can append
+        # the netns-sharing override that seals ``main`` behind it.
+        env._egress_gateway = spec.egress_gateway
+        return env
+
     def __init__(
         self,
         environment_dir: Path,
@@ -133,8 +250,38 @@ class DockerEnvironment(BaseEnvironment):
         task_env_config: EnvironmentConfig,
         keep_containers: bool = False,
         *args,
+        _prebuilt: bool = False,
+        _internal_network_when_sealed: bool = False,
+        _service_command: list[str] | None = None,
+        _service_env: dict[str, str] | None = None,
+        _gpu_device_ids: list[str] | None = None,
         **kwargs,
     ):
+        # Set before ``super().__init__`` because the base ``__init__`` calls
+        # ``_validate_definition`` (which reads this flag) before returning.
+        self._prebuilt = _prebuilt
+        # Set before any compose-path computation reads it. Only the prebuilt
+        # path passes True; the trial path keeps the False class default so its
+        # sealed containers continue to use ``network_mode: none``.
+        self._internal_network_when_sealed = _internal_network_when_sealed
+        # Service-mode command override (None = keep keepalive). Read by
+        # ``start``/``_docker_compose_paths``; set before ``super().__init__``
+        # for consistency with the other construction markers.
+        self._service_command = list(_service_command) if _service_command else None
+        # Service-container env override (None = inject nothing). Read by
+        # ``start``/``_docker_compose_paths``; set before ``super().__init__``
+        # for consistency with the other construction markers.
+        self._service_env = dict(_service_env) if _service_env else None
+        # Specific GPU device IDs from the allocator. When set, the compose
+        # resource override uses ``device_ids`` instead of ``count``.
+        self._gpu_device_ids = list(_gpu_device_ids) if _gpu_device_ids else None
+        # Shared eval network name. ``launch`` sets it post-construction when the
+        # container must join an existing network; the trial path keeps None.
+        # Declared here so it is part of the instance type, not set only dynamically.
+        self._shared_network: str | None = None
+        # Egress-gateway sidecar. ``launch`` sets it post-construction; the trial
+        # path keeps None. Declared here so it is part of the instance type.
+        self._egress_gateway: "EgressGatewaySpec | None" = None
         super().__init__(
             environment_dir=environment_dir,
             environment_name=environment_name,
@@ -150,6 +297,14 @@ class DockerEnvironment(BaseEnvironment):
         self._mounts_compose_path: Path | None = None
         self._resources_compose_temp_dir: tempfile.TemporaryDirectory | None = None
         self._resources_compose_path: Path | None = None
+        self._network_compose_temp_dir: tempfile.TemporaryDirectory | None = None
+        self._network_compose_path: Path | None = None
+        self._command_compose_temp_dir: tempfile.TemporaryDirectory | None = None
+        self._command_compose_path: Path | None = None
+        self._env_compose_temp_dir: tempfile.TemporaryDirectory | None = None
+        self._env_compose_path: Path | None = None
+        self._egress_compose_temp_dir: tempfile.TemporaryDirectory | None = None
+        self._egress_compose_path: Path | None = None
 
         # Select the platform-specific file-transfer and exec helpers.
         if self._is_windows_container:
@@ -197,11 +352,20 @@ class DockerEnvironment(BaseEnvironment):
     @property
     def capabilities(self) -> EnvironmentCapabilities:
         return EnvironmentCapabilities(
+            gpus=True,  # GPU via Compose device reservation; requires NVIDIA Container Toolkit
             disable_internet=True,
             windows=True,
             mounted=True,
             docker_compose=True,
+            serves=True,  # publishes a container port; endpoint() resolves it
+            can_commit=True,  # docker commit snapshots the running container
+            gpu_pinning=True,  # device_ids compose override pins specific GPUs
+            egress_allowlist=True,  # transparent egress gateway via a netns-sharing sidecar
         )
+
+    @property
+    def is_prebuilt(self) -> bool:
+        return self._prebuilt
 
     @property
     def _dockerfile_path(self) -> Path:
@@ -236,8 +400,16 @@ class DockerEnvironment(BaseEnvironment):
         file to override the keepalive command if it needs a different
         long-running process.
 
-        When allow_internet is False, the no-network compose file is appended
-        last to set network_mode: none on the main service.
+        When allow_internet is False the sealed-egress override is appended last.
+        Which override depends on the construction path:
+
+        - Lightweight ``launch`` envs (``_internal_network_when_sealed``
+          True) get the ``hls_internal`` internal-network override, which blocks
+          outbound internet while keeping the container reachable from the host
+          (needed for EVAL environments that serve HTTP).
+        - The trial-driven ``__init__`` path gets the
+          ``network_mode: none`` override, which removes the network namespace
+          entirely so the sealed container is unreachable by anyone.
         """
         build_or_prebuilt = (
             self._DOCKER_COMPOSE_PREBUILT_PATH
@@ -261,8 +433,38 @@ class DockerEnvironment(BaseEnvironment):
         if self._mounts_compose_path:
             paths.append(self._mounts_compose_path)
 
-        if not self.task_env_config.allow_internet:
-            paths.append(self._DOCKER_COMPOSE_NO_NETWORK_PATH)
+        # Service-mode command override. Appended after the base prebuilt/build
+        # compose (and after the windows keepalive / task compose) so Compose's
+        # last-wins merge replaces the keepalive command with the server args.
+        if self._command_compose_path:
+            paths.append(self._command_compose_path)
+
+        # Service-container environment override. Appended after the base
+        # prebuilt/build compose so its ``services.main.environment`` block is
+        # merged onto the running service process.
+        if self._env_compose_path:
+            paths.append(self._env_compose_path)
+
+        # The egress gateway, when set, IS the network seal: ``main`` joins the
+        # gateway sidecar's netns (``network_mode: service``), which is mutually
+        # exclusive with the native-block overrides below. So the seal field is
+        # AUTHORITATIVE over ``allow_internet`` -- apply the native block only when
+        # there is no gateway, rather than relying on the caller to also set
+        # ``allow_internet=True`` (a mis-set bool would otherwise double-seal and
+        # produce a conflicting compose merge).
+        if self._egress_gateway is None and not self.task_env_config.allow_internet:
+            if self._internal_network_when_sealed:
+                if self._network_compose_path:
+                    paths.append(self._network_compose_path)
+            else:
+                paths.append(self._DOCKER_COMPOSE_NO_NETWORK_PATH)
+
+        # Egress-gateway override (appended last): puts ``main`` in the gateway
+        # sidecar's network namespace so the gateway transparently intercepts/filters
+        # all egress. The seal is the gateway's redirect rules; ``allow_internet`` is
+        # irrelevant here (see above).
+        if self._egress_compose_path:
+            paths.append(self._egress_compose_path)
 
         return paths
 
@@ -293,7 +495,61 @@ class DockerEnvironment(BaseEnvironment):
             memory_limit_mb=self._resource_limit_value(
                 "memory", auto_mode=ResourceMode.LIMIT
             ),
+            gpu_count=self._effective_gpus or None,
+            gpu_device_ids=self._gpu_device_ids,
         )
+
+    def _write_network_compose_file(self) -> Path:
+        """Write the internal-network compose override (sealed-egress envs).
+
+        Only meaningful when ``allow_internet`` is False; the override attaches
+        the main service to a Docker ``internal`` network so the host can still
+        reach it while outbound internet is blocked.
+        """
+        self._cleanup_network_compose_file()
+        self._network_compose_temp_dir = tempfile.TemporaryDirectory()
+        path = Path(self._network_compose_temp_dir.name) / "docker-compose-network.json"
+        return write_network_compose_file(path, internal=True)
+
+    def _write_command_compose_file(self) -> Path:
+        """Write the service-mode command override (replaces the keepalive).
+
+        Only called when ``_service_command`` is set; the override declares
+        ``services.main.command`` with the server args and must be ordered after
+        the base prebuilt/build compose so it replaces the keepalive command.
+        """
+        self._cleanup_command_compose_file()
+        self._command_compose_temp_dir = tempfile.TemporaryDirectory()
+        path = Path(self._command_compose_temp_dir.name) / "docker-compose-command.json"
+        return write_command_compose_file(path, list(self._service_command or []))
+
+    def _write_env_compose_file(self) -> Path:
+        """Write the service-container environment override.
+
+        Called when ``_service_env`` is set; the override declares
+        ``services.main.environment`` and must be ordered after the base
+        prebuilt/build compose so its env reaches the long-lived service process.
+        """
+        self._cleanup_env_compose_file()
+        self._env_compose_temp_dir = tempfile.TemporaryDirectory()
+        path = Path(self._env_compose_temp_dir.name) / "docker-compose-env.json"
+        return write_env_compose_file(path, dict(self._service_env or {}))
+
+    def _write_egress_gateway_compose_file(self) -> Path:
+        """Write the egress-gateway sidecar override.
+
+        Only called when ``_egress_gateway`` is set; the override defines the gateway
+        service and puts ``main`` in its network namespace (``network_mode: service``)
+        so the gateway transparently intercepts and filters all of ``main``'s egress.
+        """
+        self._cleanup_egress_compose_file()
+        self._egress_compose_temp_dir = tempfile.TemporaryDirectory()
+        path = Path(self._egress_compose_temp_dir.name) / "docker-compose-egress.json"
+        if self._egress_gateway is None:
+            raise RuntimeError(
+                "_write_egress_gateway_compose_file called without an egress gateway."
+            )
+        return write_egress_gateway_compose_file(path, gateway=self._egress_gateway)
 
     def _cleanup_mounts_compose_file(self) -> None:
         if self._mounts_compose_temp_dir is None:
@@ -318,6 +574,54 @@ class DockerEnvironment(BaseEnvironment):
         finally:
             self._resources_compose_temp_dir = None
             self._resources_compose_path = None
+
+    def _cleanup_network_compose_file(self) -> None:
+        if self._network_compose_temp_dir is None:
+            return
+
+        try:
+            self._network_compose_temp_dir.cleanup()
+        except OSError as e:
+            self.logger.debug(f"Failed to remove network compose file: {e}")
+        finally:
+            self._network_compose_temp_dir = None
+            self._network_compose_path = None
+
+    def _cleanup_command_compose_file(self) -> None:
+        if self._command_compose_temp_dir is None:
+            return
+
+        try:
+            self._command_compose_temp_dir.cleanup()
+        except OSError as e:
+            self.logger.debug(f"Failed to remove command compose file: {e}")
+        finally:
+            self._command_compose_temp_dir = None
+            self._command_compose_path = None
+
+    def _cleanup_env_compose_file(self) -> None:
+        if self._env_compose_temp_dir is None:
+            return
+
+        try:
+            self._env_compose_temp_dir.cleanup()
+        except OSError as e:
+            self.logger.debug(f"Failed to remove env compose file: {e}")
+        finally:
+            self._env_compose_temp_dir = None
+            self._env_compose_path = None
+
+    def _cleanup_egress_compose_file(self) -> None:
+        if self._egress_compose_temp_dir is None:
+            return
+
+        try:
+            self._egress_compose_temp_dir.cleanup()
+        except OSError as e:
+            self.logger.debug(f"Failed to remove egress compose file: {e}")
+        finally:
+            self._egress_compose_temp_dir = None
+            self._egress_compose_path = None
 
     @property
     def _main_image_name(self) -> str:
@@ -350,6 +654,16 @@ class DockerEnvironment(BaseEnvironment):
         return env_vars
 
     def _validate_definition(self):
+        # Only the lightweight `launch` construction path is prebuilt: the image
+        # itself is the complete environment, so there is no on-disk
+        # Dockerfile/compose to validate. Note that a truthy
+        # `task_env_config.docker_image` does NOT imply prebuilt -- a trial task
+        # may set both `[environment].docker_image` and `force_build=True`, in
+        # which case `start()` sets `_use_prebuilt=False` and runs
+        # `docker compose build`, which still requires an on-disk definition. So
+        # the trial path must keep failing fast here.
+        if self.is_prebuilt:
+            return
         if (
             not self._dockerfile_path.exists()
             and not self._environment_docker_compose_path.exists()
@@ -452,7 +766,7 @@ class DockerEnvironment(BaseEnvironment):
                 f"Task declares [environment].os = {expected!r} but the Docker "
                 f"daemon is running in {daemon_os!r} container mode. "
                 f"Switch Docker Desktop to {switch_to} containers "
-                "(right-click the system tray icon → 'Switch to "
+                "(right-click the system tray icon -> 'Switch to "
                 f"{switch_to} containers...') and try again."
             )
 
@@ -496,11 +810,22 @@ class DockerEnvironment(BaseEnvironment):
             )
 
     async def start(self, force_build: bool):
-        # Volume declarations always come from the runtime override now —
+        # Volume declarations always come from the runtime override now --
         # the static base compose declares none. Write before any compose
         # command runs.
         self._mounts_compose_path = self._write_mounts_compose_file()
         self._resources_compose_path = self._write_resources_compose_file()
+        if (
+            not self.task_env_config.allow_internet
+            and self._internal_network_when_sealed
+        ):
+            self._network_compose_path = self._write_network_compose_file()
+        if self._service_command is not None:
+            self._command_compose_path = self._write_command_compose_file()
+        if self._service_env is not None:
+            self._env_compose_path = self._write_env_compose_file()
+        if self._egress_gateway is not None:
+            self._egress_compose_path = self._write_egress_gateway_compose_file()
 
         self._use_prebuilt = not force_build and self.task_env_config.docker_image
 
@@ -532,6 +857,26 @@ class DockerEnvironment(BaseEnvironment):
             pass
 
         await self._run_docker_compose_command(["up", "--detach", "--wait"])
+
+        # Connect the netns holder to the shared eval network (if set) so that
+        # containers from different compose projects can communicate, such as a
+        # driver container reaching the artifact container's service port within
+        # the same eval run.  When sealed behind the
+        # egress gateway, ``main`` shares the gateway's netns and has no NIC of its
+        # own, so the GATEWAY is connected (it holds the served port); a container in
+        # ``network_mode: service`` cannot itself be attached to a network.
+        shared_net = getattr(self, "_shared_network", None)
+        if shared_net:
+            container_id = self._compose_ps_quiet(self._network_holder())
+            if container_id:
+                try:
+                    subprocess.run(
+                        ["docker", "network", "connect", shared_net, container_id],
+                        check=True,
+                        capture_output=True,
+                    )
+                except subprocess.CalledProcessError:
+                    pass  # Non-fatal: the container may already be on this network.
 
         # Auto-create + chmod each writable mount target inside the container.  Bind
         # mounts auto-create the target as part of the mount, so mkdir is
@@ -586,6 +931,199 @@ class DockerEnvironment(BaseEnvironment):
         finally:
             self._cleanup_mounts_compose_file()
             self._cleanup_resources_compose_file()
+            self._cleanup_network_compose_file()
+            self._cleanup_command_compose_file()
+            self._cleanup_env_compose_file()
+            self._cleanup_egress_compose_file()
+
+    def _compose_ps_quiet(self, service: str) -> str:
+        """Return the container id of *service* via ``docker compose ps -q``.
+
+        Uses the same project name and compose -f list as
+        ``_run_docker_compose_command`` so it resolves the running container
+        for this session. Returns an empty string when the service has no
+        container.
+        """
+        full_command = [
+            "docker",
+            "compose",
+            "--project-name",
+            _sanitize_docker_compose_project_name(self.session_id),
+            "--project-directory",
+            str(self.environment_dir.resolve().absolute()),
+        ]
+        for path in self._docker_compose_paths:
+            full_command.extend(["-f", str(path.resolve().absolute())])
+        full_command.extend(["ps", "-q", service])
+
+        result = subprocess.run(
+            full_command,
+            capture_output=True,
+            text=True,
+            env=self._compose_env_vars(include_os_env=True),
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Failed to resolve container id for service {service!r} in "
+                f"environment {self.environment_name}: {result.stderr.strip()}"
+            )
+        return (
+            result.stdout.strip().splitlines()[0].strip()
+            if result.stdout.strip()
+            else ""
+        )
+
+    def _network_holder(self) -> str:
+        """The compose service that owns ``main``'s network namespace, identity, and
+        served port. Normally ``main`` itself; when sealed behind the egress gateway
+        ``main`` joins the gateway's netns (``network_mode: service``) with no NIC of its
+        own, so the GATEWAY holds the eval-network attachment + the port -- siblings reach
+        the served artifact through the gateway's address, and main's egress stays
+        transparently filtered by the gateway's redirect rules (inbound is untouched)."""
+        return "egress-gateway" if self._egress_gateway is not None else "main"
+
+    def endpoint(self, container_port: int) -> str:
+        """Return a host-reachable ``http://<ip>:<port>`` URL for the served container.
+
+        Resolves the netns holder's IP on its attached Docker network and builds a URL
+        the host can reach. For sealed EVAL environments the container sits on an
+        ``internal`` network, which still allows host->container traffic. Raises if the
+        container is not running or has no IP address.
+
+        When a ``shared_network`` was set (intra-eval communication), prefers the IP on
+        that specific network so sibling containers (e.g. the driver) can reach the
+        artifact via its shared-network address. When sealed behind the egress gateway,
+        the holder is the gateway (which owns ``main``'s netns + served port).
+        """
+        holder = self._network_holder()
+        container_id = self._compose_ps_quiet(holder)
+        if not container_id:
+            raise RuntimeError(
+                f"Cannot resolve endpoint: the '{holder}' container for environment "
+                f"{self.environment_name} is not running."
+            )
+
+        # When a shared eval network was set, get the IP on THAT network
+        # specifically so driver containers can reach it (they're on the same
+        # shared network but may not be on hls_internal).
+        shared_net = getattr(self, "_shared_network", None)
+        if shared_net:
+            inspect_fmt = (
+                '{{(index .NetworkSettings.Networks "' + shared_net + '").IPAddress}}'
+            )
+            net_result = subprocess.run(
+                ["docker", "inspect", "-f", inspect_fmt, container_id],
+                capture_output=True,
+                text=True,
+            )
+            if net_result.returncode == 0:
+                shared_ip = net_result.stdout.strip()
+                if shared_ip and shared_ip != "<no value>":
+                    return f"http://{shared_ip}:{container_port}"
+
+        result = subprocess.run(
+            [
+                "docker",
+                "inspect",
+                "-f",
+                "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}",
+                container_id,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"docker inspect failed for container {container_id}: "
+                f"{result.stderr.strip()}"
+            )
+
+        ip = next(
+            (part for part in result.stdout.split() if part.strip()),
+            None,
+        )
+        if not ip:
+            raise RuntimeError(
+                f"The 'main' container ({container_id}) for environment "
+                f"{self.environment_name} has no IP address on any network."
+            )
+
+        return f"http://{ip}:{container_port}"
+
+    def container_logs(self, service: str = "main") -> str:
+        """Return the combined stdout+stderr logs of a running compose service.
+
+        Used by HLS observability to capture reference/artifact container output
+        before teardown. Reads logs via 'docker logs <container_id>'.
+        """
+        container_id = self._compose_ps_quiet(service)
+        if not container_id:
+            raise RuntimeError(f"cannot read logs: service '{service}' is not running")
+        result = subprocess.run(
+            ["docker", "logs", container_id],
+            capture_output=True,
+            text=True,
+        )
+        return (result.stdout or "") + (result.stderr or "")
+
+    def commit_checkpoint(self, tag: str, entrypoint: list[str] | None = None) -> str:
+        """Snapshot the running ``main`` container into a new image ``tag``.
+
+        Runs ``docker commit`` on the ``main`` container (resolved via the same
+        compose project as the rest of this env). When *entrypoint* is given it
+        is baked into the committed image as an exec-form ENTRYPOINT via
+        ``--change``. Returns *tag*. Raises if the container is not running.
+        """
+        container_id = self._compose_ps_quiet("main")
+        if not container_id:
+            raise RuntimeError(
+                f"Cannot commit image: the 'main' container for environment "
+                f"{self.environment_name} is not running."
+            )
+
+        command = ["docker", "commit"]
+        if entrypoint is not None:
+            command.extend(["--change", f"ENTRYPOINT {json.dumps(entrypoint)}"])
+        command.extend([container_id, tag])
+
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"docker commit failed for container {container_id} "
+                f"(environment {self.environment_name}): {result.stderr.strip()}"
+            )
+
+        return tag
+
+    async def image_digest(self) -> str | None:
+        """Resolve the deployed image to its content id via ``docker inspect``.
+        Best-effort: ``None`` if the tag is unknown or docker is unavailable."""
+        image_name = self.task_env_config.docker_image
+        if not image_name:
+            return None
+        try:
+            result = await asyncio.create_subprocess_exec(
+                "docker",
+                "inspect",
+                "--format",
+                "{{.Id}}",
+                image_name,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await result.communicate()
+        except Exception as e:  # noqa: BLE001
+            self.logger.debug(f"image_digest: cannot inspect {image_name}: {e}")
+            return None
+        if result.returncode != 0:
+            # Mirror _validate_image_os: a non-zero inspect (e.g. image not yet
+            # pulled) is non-fatal, but log it so an absent digest is diagnosable.
+            self.logger.debug(
+                f"image_digest: docker inspect returned {result.returncode} "
+                f"for {image_name}"
+            )
+            return None
+        return stdout.decode("utf-8", errors="replace").strip() or None
 
     async def upload_file(self, source_path: Path | str, target_path: str):
         await self._platform.upload_file(source_path, target_path)

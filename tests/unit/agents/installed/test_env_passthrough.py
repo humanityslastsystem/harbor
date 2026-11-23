@@ -152,10 +152,11 @@ class TestExecSetupLogging:
 
         await agent.exec_as_root(environment=mock_env, command="echo ok", env={})
 
+        # The environment is never logged: it holds the agent's extra_env.
         assert any(
             rec.getMessage() == "Running command: echo ok"
             and rec.__dict__["user"] == "root"
-            and rec.__dict__["env"] == {}
+            and "env" not in rec.__dict__
             for rec in caplog.records
         )
         assert any(
@@ -186,7 +187,9 @@ class TestExecSetupLogging:
             for rec in caplog.records
         )
         assert any(
-            rec.getMessage() == "Running command: badcmd"
-            and rec.__dict__.get("env") == {"FOO": "bar"}
+            rec.getMessage() == "Running command: badcmd" and "env" not in rec.__dict__
             for rec in caplog.records
+        )
+        assert not any(
+            "bar" in str(rec.__dict__.get("env", "")) for rec in caplog.records
         )

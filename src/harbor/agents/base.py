@@ -13,6 +13,10 @@ class BaseAgent(ABC):
     logs_dir: Path
     model_name: str | None
     logger: logging.Logger
+    # Where populate_context_post_run writes trajectory.json; logs_dir when None. A caller
+    # that points logs_dir at a copy of the agent's own logs sets it elsewhere, so the
+    # trajectory never meets a file the agent named.
+    trajectory_dir: Path | None = None
 
     # Whether agent supports Harbor's trajectory format (ATIF)
     # Subclasses should override this class variable to indicate ATIF support

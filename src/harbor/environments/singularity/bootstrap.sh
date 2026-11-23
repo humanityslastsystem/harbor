@@ -7,6 +7,23 @@ mkdir -p "$WORKDIR"
 
 export DEBIAN_FRONTEND=noninteractive
 
+# --- Fast path: reuse an existing python that already has the server deps ---
+# If the image already ships uvicorn+fastapi (e.g. in its own venv on PATH), run the
+# server with that interpreter directly. This skips building the /opt/harbor-server
+# venv, which fails when /opt is not writable under a rootless apptainer overlay
+# ("Permission denied: '/opt/harbor-server'") -- exactly the case for prebuilt HLS
+# images launched with --writable-tmpfs under --fakeroot.
+# HARBOR_SERVER_PYTHON (LaunchSpec.server_python) comes last, so an image that ships
+# the deps keeps its own interpreter. Everything after this loop needs a network or root.
+for _cand in "$(command -v python3 2>/dev/null)" /opt/venv/bin/python3 /usr/bin/python3 \
+             "${HARBOR_SERVER_PYTHON:-}"; do
+  if [ -n "$_cand" ] && [ -x "$_cand" ] && "$_cand" -c "import uvicorn, fastapi" 2>/dev/null; then
+    export HARBOR_PYTHON="$_cand"
+    echo "[harbor] using existing server python: $_cand" >&2
+    exec "$HARBOR_PYTHON" "$@"
+  fi
+done
+
 # --- Refresh package index once (apt-based images) ---
 if command -v apt-get >/dev/null 2>&1; then
   apt-get update -qq 2>/dev/null || true

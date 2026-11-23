@@ -39,7 +39,16 @@ from harbor.llms.utils import (
     validate_hosted_vllm_model_config,
 )
 from harbor.models.metric import UsageInfo
+from harbor.utils.env import redact_sensitive_mapping
 from harbor.utils.logger import logger
+
+# Top-level call-detail keys under which litellm reports the credential it used; the
+# per-episode debug log records a digest of each rather than the value.
+_DIGESTED_CREDENTIAL_KEYS = ("api_key", "x-api-key")
+
+# What _clean_value returns for an entry that should not be recorded at all, so that an
+# unset value can be kept as null instead of doubling as the drop signal.
+_DROP = object()
 
 # This is used as a fallback for when the model does not support response_format
 
@@ -202,40 +211,53 @@ class LiteLLM(BaseLLM):
             return None
 
     def _clean_value(self, value):
+        """Copy ``value`` as JSON-ready data, returning ``_DROP`` for what to omit."""
         match value:
             case _ if callable(value):
+                return _DROP
+            case None:
                 return None
             case dict():
-                return {
-                    k: v
-                    for k, v in {
-                        k: self._clean_value(v) for k, v in value.items()
-                    }.items()
-                    if v is not None
-                }
+                cleaned = {key: self._clean_value(item) for key, item in value.items()}
+                return {key: item for key, item in cleaned.items() if item is not _DROP}
             case list():
-                return [
-                    self._clean_value(v)
-                    for v in value
-                    if self._clean_value(v) is not None
-                ]
+                cleaned = [self._clean_value(item) for item in value]
+                return [item for item in cleaned if item is not _DROP]
             case str() | int() | float() | bool():
                 return value
             case _:
                 return str(value)
 
+    def _redact_call_details(self, details: dict[str, Any]) -> dict[str, Any]:
+        """Copy litellm's call details with the credentials taken out.
+
+        litellm reports the key it was called with at the top level, again under
+        ``litellm_params``, and inside the ``Authorization`` header under
+        ``additional_args``, so the redaction has to reach every depth. The top-level
+        entries become a sha256 digest instead, which tells a reader which key was
+        used without exposing it; they are re-attached after the walk, which would
+        otherwise redact the digest along with everything else under a key-like name.
+        """
+        digests: dict[str, str] = {}
+        digested_keys: set[str] = set()
+        for key in _DIGESTED_CREDENTIAL_KEYS:
+            value = details.get(key)
+            if isinstance(value, str):
+                digests[f"{key}_sha256"] = hashlib.sha256(value.encode()).hexdigest()
+                digested_keys.add(key)
+
+        walked = redact_sensitive_mapping(
+            {key: value for key, value in details.items() if key not in digested_keys}
+        )
+        return walked | digests
+
     def _init_logger_fn(self, logging_path: Path):
         def logger_fn(model_call_dict: dict):
             clean_dict = self._clean_value(model_call_dict)
-            if isinstance(clean_dict, dict) and "api_key" in clean_dict:
-                hash_key = hashlib.sha256(clean_dict["api_key"].encode()).hexdigest()
-                clean_dict["api_key_sha256"] = hash_key
-                del clean_dict["api_key"]
-
-            if isinstance(clean_dict, dict) and "x-api-key" in clean_dict:
-                hash_key = hashlib.sha256(clean_dict["x-api-key"].encode()).hexdigest()
-                clean_dict["x-api-key_sha256"] = hash_key
-                del clean_dict["x-api-key"]
+            if isinstance(clean_dict, dict):
+                # Redacting after the cleaning step, so that a credential inside an
+                # object the cleaner stringified is a plain string here.
+                clean_dict = self._redact_call_details(clean_dict)
 
             # Only save post_api_call (response) to preserve logprobs
             # logger_fn is called multiple times with different event types, and

@@ -1,16 +1,24 @@
 """Unit tests for ModalEnvironment resource configuration."""
 
+import asyncio
+import io
 import json
 import logging
+import os
+import tarfile
 from pathlib import Path
 from typing import cast
+from unittest.mock import Mock
 
 import pytest
 import yaml
 
 pytest.importorskip("modal")
 
+import harbor.environments.modal as modal_mod
+from harbor.environments.base import ExecResult
 from harbor.environments.modal import (
+    _DIR_LIST_TIMEOUT_SECS,
     _MODAL_DEFAULT_CPU_REQUEST_CORES,
     _MODAL_DEFAULT_MEMORY_REQUEST_MB,
     ModalEnvironment,
@@ -325,3 +333,364 @@ class TestDinDComposeMounts:
         assert not list(env.trial_paths.trial_dir.glob("*docker-compose-mounts.json"))
         assert body["services"]["main"]["volumes"] == cast(list, volumes)
         assert target == "/harbor/compose/docker-compose-mounts.json"
+
+
+def test_modal_image_digest_reads_object_id():
+    self = Mock()
+    self._image = Mock(object_id="im-xyz")
+    assert asyncio.run(ModalEnvironment.image_digest(self)) == "im-xyz"
+
+
+def test_modal_image_digest_none_when_image_unset():
+    self = Mock()
+    self._image = None
+    assert asyncio.run(ModalEnvironment.image_digest(self)) is None
+
+
+def test_modal_image_digest_none_when_not_hydrated():
+    class _Unhydrated:
+        @property
+        def object_id(self):
+            raise RuntimeError("not hydrated")
+
+    self = Mock()
+    self._image = _Unhydrated()
+    assert asyncio.run(ModalEnvironment.image_digest(self)) is None
+
+
+# --- Fake Modal sandbox for _sdk_upload_dir tests -------------------------
+# Mimics the ``.aio(...)`` async-call convention of Modal's SDK: methods and
+# process streams expose an ``aio`` coroutine.  Just enough surface for
+# _sdk_exec (sandbox.exec + process.stdout/stderr/wait) and _sdk_upload_file
+# (sandbox.filesystem.copy_from_local).
+
+
+class _FakeMethod:
+    """Wraps a sync fn so it is callable via ``.aio(...)`` like Modal's SDK."""
+
+    def __init__(self, fn):
+        self._fn = fn
+
+    async def _acall(self, *args, **kwargs):
+        return self._fn(*args, **kwargs)
+
+    @property
+    def aio(self):
+        return self._acall
+
+
+class _FakeStream:
+    def __init__(self, data: str):
+        self.read = _FakeMethod(lambda: data)
+
+
+class _FakeProcess:
+    def __init__(self, *, stdout: str = "", stderr: str = "", return_code: int = 0):
+        self.stdout = _FakeStream(stdout)
+        self.stderr = _FakeStream(stderr)
+        self.wait = _FakeMethod(lambda: return_code)
+
+
+class _FakeFilesystem:
+    def __init__(self):
+        # (source, target, bytes); bytes are stashed at call time because the
+        # caller deletes the host tar in its finally block.
+        self.copies: list[tuple[str, str, bytes]] = []
+        self.copy_from_local = _FakeMethod(self._copy)
+
+    def _copy(self, source, target):
+        self.copies.append((str(source), str(target), Path(source).read_bytes()))
+
+
+class _FakeSandbox:
+    def __init__(self, *, extract_rc: int = 0, extract_stderr: str = ""):
+        self.filesystem = _FakeFilesystem()
+        self.commands: list[str] = []
+        self._extract_rc = extract_rc
+        self._extract_stderr = extract_stderr
+        self.exec = _FakeMethod(self._exec)
+
+    def _exec(self, shell, flag, command, **kwargs):
+        self.commands.append(command)
+        if command.startswith("tar "):
+            return _FakeProcess(
+                stderr=self._extract_stderr, return_code=self._extract_rc
+            )
+        return _FakeProcess()
+
+
+def _upload_env(temp_dir: Path, **sandbox_kwargs) -> ModalEnvironment:
+    env = _make_env(temp_dir)
+    env._sandbox = _FakeSandbox(**sandbox_kwargs)  # type: ignore[assignment]
+    return env
+
+
+def _tree_snapshot(root: Path) -> dict[str, object]:
+    """Map each entry (relative to root) to a comparable representation."""
+    snap: dict[str, object] = {}
+    for path in sorted(root.rglob("*")):
+        rel = path.relative_to(root).as_posix()
+        if path.is_symlink():
+            snap[rel] = ("symlink", os.readlink(path))
+        elif path.is_dir():
+            snap[rel] = ("dir", None)
+        else:
+            snap[rel] = ("file", path.read_bytes(), path.stat().st_mode & 0o777)
+    return snap
+
+
+class TestSdkUploadDir:
+    async def test_single_copy_and_single_extract_regardless_of_count(self, temp_dir):
+        src = temp_dir / "src"
+        (src / "a" / "b").mkdir(parents=True)
+        for i in range(25):
+            (src / f"top_{i}.txt").write_text(f"top{i}")
+        for i in range(25):
+            (src / "a" / f"mid_{i}.txt").write_text(f"mid{i}")
+        (src / "a" / "b" / "deep.txt").write_text("deep")
+
+        env = _upload_env(temp_dir)
+        sandbox = env._sandbox  # type: ignore[assignment]
+
+        await env._sdk_upload_dir(src, "/harbor/dest")
+
+        # Exactly one upload, and exactly one extract exec, plus the mkdir.
+        assert len(sandbox.filesystem.copies) == 1
+        assert len(sandbox.commands) == 2
+        assert sandbox.commands[0] == "mkdir -p /harbor/dest"
+        tar_cmds = [c for c in sandbox.commands if c.startswith("tar ")]
+        assert len(tar_cmds) == 1
+        assert " -C /harbor/dest " in tar_cmds[0]
+
+        # Tarball uploaded to a unique /tmp path; the extract exec targets it.
+        remote_tar = sandbox.filesystem.copies[0][1]
+        assert remote_tar.startswith("/tmp/harbor-upload-")
+        assert remote_tar.endswith(".tar")
+        assert remote_tar in tar_cmds[0]
+
+        # The host temp tar is removed in the finally block.
+        assert not Path(sandbox.filesystem.copies[0][0]).exists()
+
+    async def test_nested_tree_round_trips_through_real_tar(self, temp_dir):
+        src = temp_dir / "src"
+        (src / "pkg" / "sub").mkdir(parents=True)
+        (src / "empty_dir").mkdir()
+        (src / "root.txt").write_text("root file")
+        (src / "pkg" / "mod.py").write_text("print('hi')\n")
+        (src / "pkg" / "sub" / "data.bin").write_bytes(b"\x00\x01\x02\x03")
+        script = src / "run.sh"
+        script.write_text("#!/bin/sh\necho hi\n")
+        script.chmod(0o755)
+        (src / "link.txt").symlink_to("root.txt")
+
+        env = _upload_env(temp_dir)
+        await env._sdk_upload_dir(src, "/harbor/dest")
+
+        tar_bytes = env._sandbox.filesystem.copies[0][2]  # type: ignore[attr-defined]
+        dest = temp_dir / "extracted"
+        dest.mkdir()
+        with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r") as tar:
+            tar.extractall(dest, filter="fully_trusted")
+
+        assert _tree_snapshot(dest) == _tree_snapshot(src)
+
+    async def test_empty_dir_creates_target_and_succeeds(self, temp_dir):
+        src = temp_dir / "empty_src"
+        src.mkdir()
+
+        env = _upload_env(temp_dir)
+        sandbox = env._sandbox  # type: ignore[assignment]
+
+        await env._sdk_upload_dir(src, "/harbor/dest")
+
+        # Target is still created (mkdir) and an empty tar round-trips cleanly.
+        assert sandbox.commands[0] == "mkdir -p /harbor/dest"
+        assert len(sandbox.filesystem.copies) == 1
+        dest = temp_dir / "extracted"
+        dest.mkdir()
+        tar_bytes = sandbox.filesystem.copies[0][2]
+        with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r") as tar:
+            assert tar.getmembers() == []
+            tar.extractall(dest, filter="fully_trusted")
+        assert list(dest.iterdir()) == []
+
+    async def test_missing_source_raises_file_not_found(self, temp_dir):
+        env = _upload_env(temp_dir)
+        with pytest.raises(FileNotFoundError):
+            await env._sdk_upload_dir(temp_dir / "does_not_exist", "/harbor/dest")
+
+    async def test_raises_when_sandbox_not_started(self, temp_dir):
+        src = temp_dir / "src"
+        src.mkdir()
+        env = _make_env(temp_dir)
+        env._sandbox = None  # type: ignore[assignment]
+        with pytest.raises(RuntimeError, match="Sandbox not found"):
+            await env._sdk_upload_dir(src, "/harbor/dest")
+
+    async def test_extract_failure_raises_loudly(self, temp_dir):
+        src = temp_dir / "src"
+        src.mkdir()
+        (src / "f.txt").write_text("x")
+
+        env = _upload_env(temp_dir, extract_rc=2, extract_stderr="tar: corrupt archive")
+        sandbox = env._sandbox  # type: ignore[assignment]
+
+        with pytest.raises(RuntimeError, match="tar: corrupt archive"):
+            await env._sdk_upload_dir(src, "/harbor/dest")
+
+        # Even on failure the host temp tar is cleaned up.
+        assert not Path(sandbox.filesystem.copies[0][0]).exists()
+
+
+# --- Fakes for client-side download / exec timeout tests ------------------
+# A stalled gRPC stream returns no data and never raises; these fakes model
+# that with ``.aio(...)`` coroutines that never resolve, so the client-side
+# deadline is the only thing that ends the await.
+
+
+class _HangingMethod:
+    """A ``.aio(...)`` coroutine that never resolves (models a stalled stream)."""
+
+    async def _acall(self, *args, **kwargs):
+        await asyncio.Event().wait()
+
+    @property
+    def aio(self):
+        return self._acall
+
+
+class _HangingStream:
+    def __init__(self):
+        self.read = _HangingMethod()
+
+
+class _StalledReadProcess:
+    """Process whose stdout read hangs forever; stderr/wait would succeed."""
+
+    def __init__(self):
+        self.stdout = _HangingStream()
+        self.stderr = _FakeStream("")
+        self.wait = _FakeMethod(lambda: 0)
+
+
+class _StalledExecSandbox:
+    def __init__(self):
+        self.exec = _FakeMethod(lambda *a, **k: _StalledReadProcess())
+
+
+class _RecordingSandbox:
+    """Sandbox whose exec returns a fixed process; records the remote timeout."""
+
+    def __init__(self, *, stdout: str = "OUT", stderr: str = "ERR", rc: int = 7):
+        self._out, self._err, self._rc = stdout, stderr, rc
+        self.exec_timeouts: list = []
+        self.exec = _FakeMethod(self._exec)
+
+    def _exec(self, shell, flag, command, timeout=None, **kwargs):
+        self.exec_timeouts.append(timeout)
+        return _FakeProcess(stdout=self._out, stderr=self._err, return_code=self._rc)
+
+
+class _CopyToLocal:
+    """Fake copy_to_local: hangs for the first ``hang_times`` calls, else records."""
+
+    def __init__(self, hang_times: int, sink: list):
+        self.hang_times = hang_times
+        self.calls = 0
+        self._sink = sink
+
+    async def _acall(self, source, target):
+        self.calls += 1
+        if self.calls <= self.hang_times:
+            await asyncio.Event().wait()
+        self._sink.append((str(source), str(target)))
+
+    @property
+    def aio(self):
+        return self._acall
+
+
+class _DownloadFilesystem:
+    def __init__(self, hang_times: int):
+        self.written: list[tuple[str, str]] = []
+        self.copy_to_local = _CopyToLocal(hang_times, self.written)
+
+
+class _DownloadSandbox:
+    def __init__(self, hang_times: int):
+        self.filesystem = _DownloadFilesystem(hang_times)
+
+
+class TestSdkExecClientTimeout:
+    async def test_none_client_timeout_is_byte_identical(self, temp_dir):
+        env = _make_env(temp_dir)
+        env._sandbox = _RecordingSandbox(stdout="OUT", stderr="ERR", rc=7)  # type: ignore[assignment]
+
+        # Default (no arg) and explicit None set no deadline and return the result as is.
+        default = await env._sdk_exec("echo hi")
+        explicit = await env._sdk_exec("echo hi", client_timeout_secs=None)
+
+        for result in (default, explicit):
+            assert result.stdout == "OUT"
+            assert result.stderr == "ERR"
+            assert result.return_code == 7
+
+    async def test_client_timeout_raises_on_stalled_read(self, temp_dir):
+        env = _make_env(temp_dir)
+        env._sandbox = _StalledExecSandbox()  # type: ignore[assignment]
+
+        with pytest.raises(TimeoutError):
+            await env._sdk_exec("echo hi", client_timeout_secs=0.05)
+
+
+class TestSdkDownloadFileTimeout:
+    async def test_hung_copy_raises_timeout_after_retry(self, temp_dir, monkeypatch):
+        monkeypatch.setattr(modal_mod, "_FILE_COPY_TIMEOUT_SECS", 0.05)
+        env = _make_env(temp_dir)
+        env._sandbox = _DownloadSandbox(hang_times=999)  # type: ignore[assignment]
+
+        with pytest.raises(TimeoutError):
+            await env._sdk_download_file("/remote/f", temp_dir / "local_f")
+
+        # @retry engaged: two attempts, both timed out (a hang would never
+        # reach the second call).
+        assert env._sandbox.filesystem.copy_to_local.calls == 2
+
+    async def test_retry_succeeds_when_second_attempt_completes(
+        self, temp_dir, monkeypatch
+    ):
+        monkeypatch.setattr(modal_mod, "_FILE_COPY_TIMEOUT_SECS", 0.05)
+        env = _make_env(temp_dir)
+        env._sandbox = _DownloadSandbox(hang_times=1)  # type: ignore[assignment]
+
+        await env._sdk_download_file("/remote/f", "/local/f")
+
+        fs = env._sandbox.filesystem
+        assert fs.copy_to_local.calls == 2
+        assert fs.written == [("/remote/f", "/local/f")]
+
+
+class TestSdkDownloadDirTimeout:
+    async def test_surfaces_file_that_times_out_twice(self, temp_dir, monkeypatch):
+        monkeypatch.setattr(modal_mod, "_FILE_COPY_TIMEOUT_SECS", 0.05)
+        env = _make_env(temp_dir)
+        env._sandbox = _DownloadSandbox(hang_times=999)  # type: ignore[assignment]
+
+        captured: dict = {}
+
+        async def _fake_exec_on_vm(command, **kwargs):
+            captured["command"] = command
+            captured["kwargs"] = kwargs
+            return ExecResult(stdout="/remote/dir/file.txt\n", stderr="", return_code=0)
+
+        env._strategy.exec_on_vm = _fake_exec_on_vm  # type: ignore[method-assign]
+
+        with pytest.raises(BaseExceptionGroup) as excinfo:
+            await env._sdk_download_dir("/remote/dir", temp_dir / "out")
+
+        # The directory-listing exec is bounded by the client-side deadline...
+        assert captured["kwargs"]["client_timeout_secs"] == _DIR_LIST_TIMEOUT_SECS
+        # ...and a file that times out on both attempts is surfaced, not swallowed.
+        matched, _rest = excinfo.value.split(TimeoutError)
+        assert matched is not None
+        assert env._sandbox.filesystem.copy_to_local.calls == 2

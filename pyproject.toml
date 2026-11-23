@@ -40,17 +40,11 @@ hb = "harbor.cli.main:app"
 requires = ["uv_build>=0.8.4,<0.9.0"]
 build-backend = "uv_build"
 
-[tool.uv.workspace]
-members = ["packages/*"]
-
-[tool.uv.sources]
-harbor-rewardkit = { workspace = true }
-
 [project.optional-dependencies]
 e2b = ["e2b>=2.4.2", "dockerfile-parse>=2.0.1"]
 daytona = ["daytona>=0.165.0"]
 islo = ["islo>=0.3.0", "dockerfile-parse>=2.0.1"]
-modal = ["modal>=1.4.0"]
+modal = ["modal>=1.5.0"]  # >=1.5.0: Sandbox.create(outbound_domain_allowlist=...) name-based egress allowlist
 runloop = ["runloop-api-client>=1.2.0"]
 tensorlake = ["tensorlake>=0.5.8"]
 gke = ["kubernetes>=32.0.0"]
@@ -67,7 +61,6 @@ tinker = [
 dev = [
     "harbor[cloud]",
     "harbor[tinker]",
-    "harbor-rewardkit",
     "ipykernel>=6.30.1",
     "pytest>=8.4.2",
     "pytest-asyncio>=1.2.0",
@@ -78,10 +71,10 @@ dev = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["harbor", "rewardkit"]
+known-first-party = ["harbor"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests", "packages/rewardkit/tests"]
+testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
@@ -96,7 +89,7 @@ markers = [
 asyncio_mode = "auto"
 
 [tool.coverage.run]
-source = ["src/harbor", "packages/rewardkit/src/rewardkit"]
+source = ["src/harbor"]
 omit = ["*/tests/*", "*/__pycache__/*", "*/migrations/*"]
 
 [tool.coverage.report]
@@ -115,5 +108,5 @@ exclude_lines = [
 python = ".venv"
 
 [tool.ty.src]
-include = ["src/harbor", "packages/rewardkit/src"]
+include = ["src/harbor"]
 exclude = ["src/harbor/cli/template-adapter", "src/harbor/cli/template-task", "src/harbor/agents/installed/openhands_sdk_runner.py", "src/harbor/agents/installed/nemo_agent_run_wrapper.py"]

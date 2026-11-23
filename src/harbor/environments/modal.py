@@ -4,10 +4,11 @@ import asyncio
 import os
 import re
 import shlex
+import tarfile
 import tempfile
 from abc import abstractmethod
-from pathlib import Path, PurePosixPath
-from typing import Any
+from pathlib import Path
+from typing import Any, TYPE_CHECKING
 from uuid import uuid4
 
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -40,6 +41,9 @@ from harbor.models.trial.paths import TrialPaths
 from harbor.utils.env import resolve_env_vars
 from harbor.utils.optional_import import MissingExtraError
 
+if TYPE_CHECKING:
+    from harbor.environments.launch import LaunchSpec
+
 try:
     from modal import App, Image, Sandbox, Secret, Volume
 
@@ -49,6 +53,45 @@ except ImportError:
 
 _MODAL_DEFAULT_CPU_REQUEST_CORES = 0.125
 _MODAL_DEFAULT_MEMORY_REQUEST_MB = 128
+
+# Default deadline (seconds) for resolving a sandbox's tunnel map in endpoint().
+# GPU sandboxes (e.g. oracle/metric) may take longer to boot and expose their
+# encrypted-port tunnel. 300s gives headroom for GPU allocation (which can take
+# 2-5 minutes for GPU types like A100/H100 under demand) plus container boot time.
+_MODAL_TUNNEL_TIMEOUT_SEC = 300
+
+# Client-side deadline (seconds) per file copy. The SDK copy call exposes no
+# deadline parameter and a stalled stream never raises, so bound each copy here.
+_FILE_COPY_TIMEOUT_SECS = 120
+
+# Client-side deadline (seconds) for the directory-listing exec that precedes a
+# recursive download. Bounds the local SDK awaits so a stalled stream cannot
+# wedge the pull before any file copy begins.
+_DIR_LIST_TIMEOUT_SECS = 60
+
+
+def _run_blocking(make_coro: Any) -> Any:
+    """Run an async SDK call from a synchronous method.
+
+    ``endpoint()`` matches the synchronous ``BaseEnvironment.endpoint``
+    signature but Modal's tunnel lookup is async. ``make_coro`` is a zero-arg
+    factory that builds the coroutine; building it lazily lets us create it on
+    whichever event loop will actually run it. When no loop is running we use
+    ``asyncio.run``; when called from within a running loop (e.g. an async
+    deploy path) we run it to completion on a dedicated worker thread.
+    """
+    import concurrent.futures
+
+    async def _run() -> Any:
+        return await make_coro()
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(_run())
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(lambda: asyncio.run(_run())).result()
 
 
 class _ModalStrategy:
@@ -137,6 +180,24 @@ class _ModalStrategy:
             env._app = None
             env._image = None
 
+    async def container_logs(self, service: str = "main") -> str:
+        """Capture the sandbox's stdout+stderr and return them as a string.
+
+        Terminates the sandbox first so the streams reach EOF, then reads them
+        via the Modal SDK.  The sandbox is stopped as a side-effect; a
+        subsequent ``stop()`` call is safe (idempotent: no sandbox to tear
+        down).  Subclasses that run Docker-in-Docker override this to read
+        logs via ``docker compose logs`` before stopping.
+        """
+        env = self._env
+        saved_sandbox = env._sandbox
+        await self._teardown_sandbox()  # terminates → EOF on streams
+        if saved_sandbox is None:
+            return ""
+        stdout = await saved_sandbox.stdout.read.aio()
+        stderr = await saved_sandbox.stderr.read.aio()
+        return (stdout or "") + (stderr or "")
+
     async def exec_on_vm(
         self,
         command: str,
@@ -144,10 +205,16 @@ class _ModalStrategy:
         env: dict[str, str] | None = None,
         timeout_sec: int | None = None,
         shell: str = "bash",
+        client_timeout_secs: float | None = None,
     ) -> ExecResult:
         """Run a command directly on the sandbox VM (bypasses compose)."""
         return await self._env._sdk_exec(
-            command, cwd=cwd, env=env, timeout_sec=timeout_sec, shell=shell
+            command,
+            cwd=cwd,
+            env=env,
+            timeout_sec=timeout_sec,
+            shell=shell,
+            client_timeout_secs=client_timeout_secs,
         )
 
 
@@ -217,6 +284,41 @@ class _ModalDirect(_ModalStrategy):
                 "shell",
                 env._sandbox.object_id,
             ],
+        )
+
+
+class _ModalServe(_ModalDirect):
+    """Serve-mode strategy: run a prebuilt image's service command as the
+    sandbox's main process, with the service port tunnelled.
+
+    Created via ``ModalEnvironment.launch(LaunchSpec(...))``. Unlike
+    ``_ModalDirect`` (agent-eval: a keepalive sandbox the agent execs into),
+    this boots ``serve_command`` directly and exposes ``service_port`` through a
+    Modal encrypted-port tunnel resolved by ``endpoint()``. exec/attach/upload/
+    download are inherited from ``_ModalDirect`` for debugging the live service.
+    """
+
+    async def start(self, force_build: bool) -> None:
+        env = self._env
+
+        serve_image = env._serve_image
+        if isinstance(serve_image, str):
+            env._image = Image.from_registry(serve_image, secret=None)
+        else:
+            # A modal.Image handle produced by a prior commit_checkpoint
+            # (filesystem snapshot) — run it directly, no registry pull.
+            env._image = serve_image
+
+        env._app = await App.lookup.aio(
+            name=env._app_name,
+            create_if_missing=True,
+        )
+
+        encrypted_ports = [env._service_port] if env._service_port is not None else []
+        env._sandbox = await env._create_sandbox(
+            command_args=env._service_command or [],
+            encrypted_ports=encrypted_ports,
+            region=env._serve_region,
         )
 
 
@@ -629,6 +731,17 @@ class _ModalDinD(_ModalStrategy):
 
         await self._wait_for_main_container()
 
+    async def container_logs(self, service: str = "main") -> str:
+        """Capture logs from a docker compose service running inside the DinD sandbox.
+
+        Reads via ``docker compose logs <service>`` while the sandbox is still
+        alive (the compose stack has not been torn down yet).  Overrides the
+        base strategy which reads the sandbox's own stdout/stderr (not relevant
+        for DinD where the compose services produce the meaningful output).
+        """
+        result = await self._compose_exec(["logs", service])
+        return (result.stdout or "") + (result.stderr or "")
+
     async def stop(self, delete: bool) -> None:
         if self._env._sandbox:
             try:
@@ -834,7 +947,83 @@ class ModalEnvironment(BaseEnvironment):
     def _environment_definition_path(self) -> Path:
         return self.environment_dir / "Dockerfile"
 
+    @property
+    def is_prebuilt(self) -> bool:
+        """True when constructed from a LaunchSpec (serve mode): a prebuilt
+        image (registry tag or snapshot handle), no on-disk build definition."""
+        return self._serve_mode
+
+    async def image_digest(self) -> str | None:
+        """Modal's content-addressed built-image id (``im-…``), available once the
+        image is hydrated (after the sandbox is created). ``None`` when no image is
+        set or it has not hydrated yet. Never raises."""
+        img = self._image
+        if img is None:
+            return None
+        try:
+            return img.object_id
+        except Exception:  # noqa: BLE001
+            return None
+
+    @classmethod
+    def launch(cls, spec: "LaunchSpec") -> "ModalEnvironment":
+        """Construct a prebuilt serve-mode ModalEnvironment from a LaunchSpec.
+
+        Mirrors ``DockerEnvironment.launch``: no on-disk Dockerfile/compose and
+        no trial scaffolding — the image (a registry tag, or a ``modal.Image``
+        handle returned by a prior ``commit_checkpoint``) is the definition.
+        The sandbox is NOT created here; that happens in ``start()``. The spec
+        is validated against this backend's capabilities (fail loud) before
+        returning — notably a ``gpu_device_ids`` request raises because Modal
+        has no device pinning (gpu_pinning=False).
+        """
+        import uuid
+
+        # docker_image is a str field; a non-str image handle (modal.Image from a
+        # snapshot) is carried separately in _serve_image and consumed by start().
+        # gpu_kind from the spec maps to EnvironmentConfig.gpu_types so _gpu_config()
+        # can request the correct GPU model (e.g. "H100:1" instead of "any:1").
+        task_env_config = EnvironmentConfig(
+            docker_image=spec.image if isinstance(spec.image, str) else None,
+            gpus=spec.gpus or None,
+            gpu_types=[spec.gpu_kind] if spec.gpu_kind else None,
+            cpus=spec.cpus,
+            memory_mb=spec.memory_mb,
+            allow_internet=spec.allow_internet,
+            workdir=spec.workdir,
+            # Runtime env vars (HF_HUB_OFFLINE, model config, secrets) are
+            # injected into the sandbox as a Modal Secret at start() — they flow
+            # task_env_config.env -> _persistent_env -> _secrets_config().
+            env=dict(spec.env),
+        )
+
+        environment_dir = Path(tempfile.mkdtemp(prefix="hb-modal-launch-"))
+        trial_paths = TrialPaths(trial_dir=environment_dir)
+
+        short_id = uuid.uuid4().hex[:8]
+        env = cls(
+            environment_dir=environment_dir,
+            environment_name=f"launch-{short_id}",
+            session_id=f"launch-{short_id}",
+            trial_paths=trial_paths,
+            task_env_config=task_env_config,
+            mounts=list(spec.mounts) if spec.mounts else None,
+            _serve_mode=True,
+            _service_command=list(spec.serve_command) if spec.serve_command else None,
+            _service_port=spec.service_port,
+            _serve_image=spec.image,
+            _serve_region=spec.region,
+            _launch_outbound_cidr_allowlist=spec.outbound_cidr_allowlist,
+            _launch_outbound_domain_allowlist=spec.outbound_domain_allowlist,
+        )
+        env._validate_launch_capabilities(spec)
+        return env
+
     def _validate_definition(self):
+        # Serve mode runs a prebuilt image (registry tag or snapshot handle);
+        # there is no on-disk Dockerfile/compose to validate.
+        if self._serve_mode:
+            return
         if self.task_env_config.docker_image:
             return
         if self._compose_mode:
@@ -861,6 +1050,13 @@ class ModalEnvironment(BaseEnvironment):
         sandbox_idle_timeout_secs: int | None = None,
         extra_docker_compose: list[Path] | None = None,
         *args,
+        _serve_mode: bool = False,
+        _service_command: list[str] | None = None,
+        _service_port: int | None = None,
+        _serve_image: str | object | None = None,
+        _serve_region: str | None = None,
+        _launch_outbound_cidr_allowlist: list[str] | None = None,
+        _launch_outbound_domain_allowlist: list[str] | None = None,
         **kwargs,
     ):
         """
@@ -892,17 +1088,52 @@ class ModalEnvironment(BaseEnvironment):
                 timeout (default). See Modal sandbox docs:
                 https://modal.com/docs/reference/modal.Sandbox#create
         """
+        # Serve-mode markers. Set *before* super().__init__ because
+        # _validate_definition / capability validators read them.
+        self._serve_mode = _serve_mode
+        self._service_command = list(_service_command) if _service_command else None
+        self._service_port = _service_port
+        # Opaque runnable image handle for serve mode: a registry tag (str) or a
+        # modal.Image from a prior snapshot. modal.Image is only importable when
+        # the optional extra is installed, so this stays Any at the type level.
+        self._serve_image: Any = _serve_image
+        # Region to place the serve sandbox in (co-locates a load driver with
+        # the artifact it measures); None lets Modal choose.
+        self._serve_region = _serve_region
+        # Outbound allowlists sealing the sandbox to specific destinations (the
+        # egress proxy / model gateway), by CIDR and/or by domain name. None lets
+        # egress follow the normal block_network policy. Set by ``launch`` from
+        # LaunchSpec; threaded into Sandbox.create by _create_sandbox.
+        self._launch_outbound_cidr_allowlist = _launch_outbound_cidr_allowlist
+        self._launch_outbound_domain_allowlist = _launch_outbound_domain_allowlist
+        # Resolved tunnel map, cached after the first endpoint() lookup.
+        self._tunnels: dict[int, Any] | None = None
+
         # Detect compose mode *before* super().__init__ which calls
         # _validate_definition
         self._compose_mode = (environment_dir / "docker-compose.yaml").exists() or bool(
             extra_docker_compose
         )
-        # DinD mode requires host networking — cannot enforce network isolation.
-        self._capabilities = EnvironmentCapabilities(
-            gpus=True,
-            disable_internet=not self._compose_mode,
-            docker_compose=True,
-        )
+        if self._serve_mode:
+            # Serve path: a long-lived service on a tunnelled port, snapshot-able.
+            # Modal pins GPU count+type only (no device indices), so gpu_pinning
+            # stays False — a LaunchSpec with gpu_device_ids set is rejected by
+            # the inherited _validate_launch_capabilities.
+            self._capabilities = EnvironmentCapabilities(
+                gpus=True,
+                disable_internet=True,
+                serves=True,
+                can_commit=True,
+                gpu_pinning=False,
+                egress_allowlist=True,  # Sandbox.create(outbound_cidr_allowlist=...)
+            )
+        else:
+            # DinD mode requires host networking — cannot enforce network isolation.
+            self._capabilities = EnvironmentCapabilities(
+                gpus=True,
+                disable_internet=not self._compose_mode,
+                docker_compose=True,
+            )
         self._kwargs = kwargs
         if not _HAS_MODAL:
             raise MissingExtraError(package="modal", extra="modal")
@@ -926,10 +1157,15 @@ class ModalEnvironment(BaseEnvironment):
         self._sandbox_timeout = sandbox_timeout_secs
         self._sandbox_idle_timeout = sandbox_idle_timeout_secs
 
-        # Select strategy based on compose mode
-        self._strategy: _ModalStrategy = (
-            _ModalDinD(self) if self._compose_mode else _ModalDirect(self)
-        )
+        # Select strategy: serve mode takes precedence (a prebuilt service),
+        # then DinD compose, then the single-container direct strategy.
+        self._strategy: _ModalStrategy
+        if self._serve_mode:
+            self._strategy = _ModalServe(self)
+        elif self._compose_mode:
+            self._strategy = _ModalDinD(self)
+        else:
+            self._strategy = _ModalDirect(self)
         self.logger.debug(f"Selected strategy: {self._strategy.__class__.__name__}")
 
     @property
@@ -1005,8 +1241,17 @@ class ModalEnvironment(BaseEnvironment):
         *,
         block_network: bool | None = None,
         experimental_options: dict[str, Any] | None = None,
+        command_args: list[str] | None = None,
+        encrypted_ports: list[int] | None = None,
+        region: str | None = None,
     ) -> Sandbox:
-        """Create a sandbox with retry logic for transient failures."""
+        """Create a sandbox with retry logic for transient failures.
+
+        ``command_args`` are passed as the sandbox's main process (positional
+        args to ``Sandbox.create``); empty means a keepalive sandbox. Serve mode
+        uses ``encrypted_ports`` to open a public HTTPS tunnel on the service
+        port (resolved later by ``endpoint()``) and optionally pins ``region``.
+        """
         if block_network is None:
             block_network = not self.task_env_config.allow_internet
 
@@ -1019,8 +1264,39 @@ class ModalEnvironment(BaseEnvironment):
             kwargs["memory"] = memory
         if (gpu := self._gpu_config()) is not None:
             kwargs["gpu"] = gpu
+        if encrypted_ports:
+            kwargs["encrypted_ports"] = encrypted_ports
+            # Modal rejects ``block_network=True`` together with open ports: a
+            # served sandbox must keep its inbound encrypted-port tunnel
+            # reachable (that URL is how the load driver reaches it). Realize a
+            # "sealed" served sandbox as inbound-open + outbound-denied instead:
+            # an empty outbound allowlist permits no egress CIDRs (deny all),
+            # preserving the trust boundary (the artifact can't call out /
+            # exfiltrate) while remaining reachable.
+            if block_network:
+                block_network = False
+                kwargs["outbound_cidr_allowlist"] = []
+        if region is not None:
+            kwargs["region"] = region
+        # Seal the sandbox to an explicit outbound allowlist (e.g. only the egress
+        # proxy / model gateway), by CIDR and/or by domain name. Modal forbids
+        # ``block_network=True`` with an allowlist, so any allowlist forces
+        # block_network False -- egress is restricted to these destinations rather
+        # than blocked entirely. This overrides the empty deny-all set above for
+        # served sandboxes: a sealed producer must still reach its proxy/gateway.
+        if self._launch_outbound_cidr_allowlist:
+            block_network = False
+            kwargs["outbound_cidr_allowlist"] = list(
+                self._launch_outbound_cidr_allowlist
+            )
+        if self._launch_outbound_domain_allowlist:
+            block_network = False
+            kwargs["outbound_domain_allowlist"] = list(
+                self._launch_outbound_domain_allowlist
+            )
 
         return await Sandbox.create.aio(
+            *(command_args or []),
             app=self._app,
             image=self._image,
             timeout=self._sandbox_timeout,
@@ -1050,6 +1326,7 @@ class ModalEnvironment(BaseEnvironment):
         timeout_sec: int | None = None,
         shell: str = "bash",
         login: bool = False,
+        client_timeout_secs: float | None = None,
     ) -> ExecResult:
         """Execute a command directly on the Modal sandbox VM.
 
@@ -1062,6 +1339,12 @@ class ModalEnvironment(BaseEnvironment):
                 ``"sh"`` for Alpine-based images like docker:dind).
             login: If True, use a login shell (``-lc``) so that
                 ``.bashrc``, ``.profile``, etc. are sourced.
+            client_timeout_secs: Optional client-side deadline bounding the
+                local SDK await sequence (exec + stdout/stderr read + wait).
+                This is distinct from ``timeout_sec``: Modal's exec ``timeout=``
+                bounds the REMOTE process, whereas this bounds the LOCAL SDK
+                awaits so a stalled gRPC stream cannot hang forever. ``None``
+                (the default) sets no client-side deadline.
         """
         # Merge persistent env vars (--ae flags) with per-exec env vars
         env = self._merge_env(env)
@@ -1069,24 +1352,29 @@ class ModalEnvironment(BaseEnvironment):
         if not self._sandbox:
             raise RuntimeError("Sandbox not found. Please start the environment first.")
 
-        process = await self._sandbox.exec.aio(
-            shell,
-            "-lc" if login else "-c",
-            command,
-            workdir=cwd,
-            secrets=[Secret.from_dict(env)] if env else [],  # type: ignore
-            timeout=timeout_sec,
-        )
+        async def _run() -> ExecResult:
+            process = await self._sandbox.exec.aio(
+                shell,
+                "-lc" if login else "-c",
+                command,
+                workdir=cwd,
+                secrets=[Secret.from_dict(env)] if env else [],  # type: ignore
+                timeout=timeout_sec,
+            )
 
-        stdout = await process.stdout.read.aio()
-        stderr = await process.stderr.read.aio()
-        return_code = await process.wait.aio()
+            stdout = await process.stdout.read.aio()
+            stderr = await process.stderr.read.aio()
+            return_code = await process.wait.aio()
 
-        return ExecResult(
-            stdout=stdout,
-            stderr=stderr,
-            return_code=return_code,
-        )
+            return ExecResult(
+                stdout=stdout,
+                stderr=stderr,
+                return_code=return_code,
+            )
+
+        if client_timeout_secs is None:
+            return await _run()
+        return await asyncio.wait_for(_run(), timeout=client_timeout_secs)
 
     @retry(
         stop=stop_after_attempt(2),
@@ -1111,6 +1399,13 @@ class ModalEnvironment(BaseEnvironment):
         """
         Adds a local directory to the environment.
 
+        The Modal filesystem API has no directory primitive, so instead of one
+        round-trip per file this packs the directory's contents into a single
+        uncompressed tar on the host, uploads that one tarball, and extracts it
+        on the sandbox: two Modal round-trips (upload + extract exec) plus the
+        target ``mkdir``, regardless of file count.  tar preserves modes and
+        symlinks.
+
         Args:
             source_dir: The path to the source local directory.
             target_dir: The path to which to copy the directory.
@@ -1124,18 +1419,36 @@ class ModalEnvironment(BaseEnvironment):
 
         shell = self._default_shell
         await self._sdk_exec(f"mkdir -p {shlex.quote(target_dir)}", shell=shell)
-        for file_path in source_path.rglob("*"):
-            if file_path.is_file():
-                relative_path = file_path.relative_to(source_path).as_posix()
-                target_file_path = str(PurePosixPath(target_dir) / relative_path)
 
-                target_file_parent = str(PurePosixPath(target_file_path).parent)
-                if target_file_parent != target_dir:
-                    await self._sdk_exec(
-                        f"mkdir -p {shlex.quote(target_file_parent)}", shell=shell
-                    )
+        # Pack contents with arcnames relative to the source root so that
+        # extraction with ``-C target_dir`` lands files directly in the target.
+        # An empty source dir yields an empty tar and the target (already
+        # created above) is left empty -- a valid no-op.
+        fd, host_tar = tempfile.mkstemp(suffix=".tar")
+        os.close(fd)
+        try:
+            with tarfile.open(host_tar, "w") as tar:
+                for entry in sorted(source_path.iterdir()):
+                    tar.add(entry, arcname=entry.name)
 
-                await self._sdk_upload_file(file_path, target_file_path)
+            remote_tar = f"/tmp/harbor-upload-{uuid4().hex}.tar"
+            await self._sdk_upload_file(host_tar, remote_tar)
+
+            # _sdk_exec returns a nonzero return_code rather than raising, so
+            # check it explicitly and fail loud with the captured stderr.
+            quoted_tar = shlex.quote(remote_tar)
+            result = await self._sdk_exec(
+                f"tar -xf {quoted_tar} -C {shlex.quote(target_dir)} "
+                f"&& rm -f {quoted_tar}",
+                shell=shell,
+            )
+            if result.return_code != 0:
+                raise RuntimeError(
+                    f"Failed to extract {remote_tar} into {target_dir} "
+                    f"(rc={result.return_code}): {result.stderr}"
+                )
+        finally:
+            os.remove(host_tar)
 
     @retry(
         stop=stop_after_attempt(2),
@@ -1155,8 +1468,13 @@ class ModalEnvironment(BaseEnvironment):
         if not self._sandbox:
             raise RuntimeError("Sandbox not found. Please start the environment first.")
 
-        # Creates parent directories locally if needed.
-        await self._sandbox.filesystem.copy_to_local.aio(source_path, target_path)
+        # Creates parent directories locally if needed. The SDK call has no
+        # deadline parameter and a stalled stream never raises, so bound it here;
+        # the raised TimeoutError then flows through @retry.
+        await asyncio.wait_for(
+            self._sandbox.filesystem.copy_to_local.aio(source_path, target_path),
+            timeout=_FILE_COPY_TIMEOUT_SECS,
+        )
 
     async def _sdk_download_dir(self, source_dir: str, target_dir: Path | str) -> None:
         """
@@ -1177,7 +1495,9 @@ class ModalEnvironment(BaseEnvironment):
         # the strategy's exec (which in DinD mode routes to the compose
         # container, not the sandbox filesystem).
         result = await self._strategy.exec_on_vm(
-            f"find {shlex.quote(source_dir)} -type f", shell="sh"
+            f"find {shlex.quote(source_dir)} -type f",
+            shell="sh",
+            client_timeout_secs=_DIR_LIST_TIMEOUT_SECS,
         )
         if result.return_code != 0:
             raise RuntimeError(f"Failed to list files in {source_dir}: {result.stderr}")
@@ -1205,6 +1525,20 @@ class ModalEnvironment(BaseEnvironment):
 
     async def stop(self, delete: bool):
         return await self._strategy.stop(delete)
+
+    async def container_logs(self, service: str = "main") -> str:
+        """Capture and return stdout+stderr of the named service.
+
+        For serve/direct mode (single Modal sandbox): terminates the sandbox so
+        its output streams reach EOF, then reads and returns them.  The sandbox
+        is stopped as a side-effect — a subsequent ``stop()`` call is a safe
+        no-op.
+
+        For DinD/compose mode: reads ``docker compose logs <service>`` while
+        the compose stack is still running; the caller must call ``stop()``
+        separately to tear down the sandbox.
+        """
+        return await self._strategy.container_logs(service)
 
     async def exec(
         self,
@@ -1250,3 +1584,59 @@ class ModalEnvironment(BaseEnvironment):
 
     async def attach(self) -> None:
         return await self._strategy.attach()
+
+    def endpoint(self, container_port: int) -> str:
+        """Return the public HTTPS tunnel URL for an encrypted service port.
+
+        Serve mode opens ``encrypted_ports=[service_port]`` at sandbox-create
+        time; Modal exposes each as a public tunnel. Resolves (and caches) the
+        sandbox's tunnel map and returns ``tunnels[container_port].url``. Raises
+        if the sandbox is not started or the port has no tunnel.
+        """
+        if not self._sandbox:
+            raise RuntimeError(
+                "Cannot resolve endpoint: the Modal sandbox is not started. "
+                "Call start() first."
+            )
+        if self._tunnels is None:
+            sandbox = self._sandbox
+            self._tunnels = _run_blocking(
+                lambda: sandbox.tunnels.aio(_MODAL_TUNNEL_TIMEOUT_SEC)
+            )
+
+        tunnel = self._tunnels.get(container_port)
+        if tunnel is None:
+            available = sorted(self._tunnels)
+            raise RuntimeError(
+                f"No Modal tunnel for port {container_port} "
+                f"(available tunnelled ports: {available}). The port must be "
+                "declared via LaunchSpec.service_port before start()."
+            )
+        return tunnel.url
+
+    def commit_checkpoint(
+        self, tag: str, entrypoint: list[str] | None = None
+    ) -> object:
+        """Snapshot the sandbox filesystem into a reusable ``modal.Image``.
+
+        Captures the entire filesystem (agent-written files + installed deps),
+        mirroring ``docker commit`` on the local backend. Returns the
+        ``modal.Image`` handle, which ``ModalEnvironment.launch`` accepts back as
+        ``LaunchSpec.image`` for a fresh serve sandbox.
+
+        ``tag`` and ``entrypoint`` are ignored on Modal: the snapshot does not
+        bake an ENTRYPOINT — the serve command is supplied at the next launch
+        (HLS carries ``serve_command`` separately). Gated by ``can_commit``.
+        """
+        if not self.capabilities.can_commit:
+            raise ValueError(
+                f"{self.type()} environment cannot commit a checkpoint "
+                "(can_commit=False)."
+            )
+        if not self._sandbox:
+            raise RuntimeError(
+                "Cannot commit checkpoint: the Modal sandbox is not started. "
+                "Call start() first."
+            )
+        sandbox = self._sandbox
+        return _run_blocking(lambda: sandbox.snapshot_filesystem.aio())

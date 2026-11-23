@@ -2,6 +2,7 @@ import copy
 import shlex
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -48,6 +49,7 @@ from harbor.models.trajectories import (
     Trajectory,
 )
 from harbor.models.trial.paths import EnvironmentPaths
+from harbor.utils.env import redact_sensitive_mapping
 from harbor.utils.trajectory_utils import format_trajectory_json
 
 
@@ -68,6 +70,18 @@ class SubagentMetrics:
 
 
 class Terminus2(BaseAgent):
+    """Agent that drives a tmux session by parsing commands out of model responses.
+
+    Completion is signalled twice: the first ``task_complete`` gets a confirmation
+    re-prompt, the second ends the run. The stock re-prompt presents stopping as the
+    trigger for grading, which is the wrong framing for a run where stopping early is
+    itself a failure, so callers can supply their own text for that turn through the
+    ``completion_guidance`` constructor argument. It is a callable evaluated at each
+    confirmation, so the text may depend on state that moves during the run, such as
+    the time left in a wall-clock budget. See ``__init__`` for both it and
+    ``completion_guidance_mode``.
+    """
+
     SUPPORTS_ATIF: bool = True
 
     def _init_llm(
@@ -171,6 +185,8 @@ class Terminus2(BaseAgent):
         llm_kwargs: dict | None = None,
         llm_call_kwargs: dict[str, Any] | None = None,
         extra_env: dict[str, str] | None = None,
+        completion_guidance: Callable[[], str | None] | None = None,
+        completion_guidance_mode: Literal["append", "replace"] = "append",
         *args,
         **kwargs,
     ):
@@ -223,6 +239,20 @@ class Terminus2(BaseAgent):
             llm_kwargs: Additional kwargs to pass to the LLM constructor.
                 (default: None)
             llm_call_kwargs: Extra kwargs to forward to LLM calls (e.g., extra_body).
+            completion_guidance: Callable returning text to include in the completion
+                confirmation re-prompt, or None to leave that prompt as it is. Returning
+                None or an empty string from the callable is also treated as no guidance.
+                It is called once per confirmation instead of being read at construction,
+                so the text can carry state that moves during the run, such as the time
+                left in a wall-clock budget. (default: None)
+            completion_guidance_mode: Where the guidance sits relative to the stock
+                "Are you sure you want to mark the task as complete?" prompt. "append"
+                keeps that prompt and puts the guidance after it; "replace" sends the
+                guidance instead of it. Appending is the default because the stock prompt
+                is what tells the model how to confirm in the configured parser's syntax,
+                which is orthogonal to guidance about whether to stop; a caller that also
+                wants to restate the syntax can pass "replace". The terminal state header
+                is sent in both modes. (default: "append")
             **kwargs: Additional arguments
         """
         super().__init__(logs_dir, model_name, *args, **kwargs)
@@ -231,9 +261,17 @@ class Terminus2(BaseAgent):
         if model_name is None:
             raise ValueError("model_name is required for Terminus 2")
 
+        if completion_guidance_mode not in ("append", "replace"):
+            raise ValueError(
+                f"Unknown completion_guidance_mode: {completion_guidance_mode!r}. "
+                "Use 'append' or 'replace'."
+            )
+
         self._model_name = model_name
         self._last_response_model_name: str | None = None
         self._parser_name = parser_name
+        self._completion_guidance = completion_guidance
+        self._completion_guidance_mode = completion_guidance_mode
         self._collect_rollout_details = collect_rollout_details
         self._reasoning_effort = reasoning_effort
         resolved_model_info = self._resolve_model_info(model_name, model_info)
@@ -484,18 +522,21 @@ class Terminus2(BaseAgent):
             )
 
     def _get_completion_confirmation_message(self, terminal_output: str) -> str:
-        """Return the format-specific task completion confirmation message."""
+        """Return the format-specific task completion confirmation message.
+
+        Any ``completion_guidance`` the caller configured is evaluated here, which is
+        why it sees the run as it stands at this confirmation rather than as it stood
+        at construction.
+        """
         if self._parser_name == "json":
-            return (
-                f"Current terminal state:\n{terminal_output}\n\n"
+            prompt = (
                 "Are you sure you want to mark the task as complete? "
                 "This will trigger your solution to be graded and you won't be able to "
                 'make any further corrections. If so, include "task_complete": true '
                 "in your JSON response again."
             )
         elif self._parser_name == "xml":
-            return (
-                f"Current terminal state:\n{terminal_output}\n\n"
+            prompt = (
                 "Are you sure you want to mark the task as complete? "
                 "This will trigger your solution to be graded and you won't be able to "
                 "make any further corrections. If so, include "
@@ -505,6 +546,15 @@ class Terminus2(BaseAgent):
             raise ValueError(
                 f"Unknown parser_name: {self._parser_name}. Use 'json' or 'xml'."
             )
+
+        guidance = self._completion_guidance() if self._completion_guidance else None
+        if guidance:
+            if self._completion_guidance_mode == "replace":
+                prompt = guidance
+            else:
+                prompt = f"{prompt}\n\n{guidance}"
+
+        return f"Current terminal state:\n{terminal_output}\n\n{prompt}"
 
     def _setup_episode_logging(
         self, logging_dir: Path | None, episode: int
@@ -1934,7 +1984,11 @@ so ask everything you need to know."""
         if self._temperature is not None:
             agent_extra["temperature"] = self._temperature
         if self._llm_kwargs:
-            agent_extra["llm_kwargs"] = self._llm_kwargs
+            # These kwargs are forwarded to the LLM constructor and then to every
+            # completion call, so an api_key or an Authorization header is a natural
+            # thing for a caller to put here, and the trajectory is written to disk and
+            # shared. Record what was configured, not the credentials.
+            agent_extra["llm_kwargs"] = redact_sensitive_mapping(self._llm_kwargs)
         if self._linear_history and continuation_index > 0:
             agent_extra["continuation_index"] = continuation_index
 

@@ -1,5 +1,15 @@
 # Harbor
 
+> **This repository is a fork of [Harbor](https://github.com/harbor-framework/harbor).** It is
+> based on upstream commit `6a7b64f` (2026-05-22,
+> [PR #1705](https://github.com/harbor-framework/harbor/pull/1705)). It is the agent and
+> environment runtime of HLS, and all of its changes to upstream are in the one commit that
+> follows that base. It is not the `harbor` package on PyPI: `pip install harbor` and
+> `uv tool install harbor` install upstream. Install this fork from a checkout of this
+> repository (`uv pip install .`), or use it through HLS, which includes it as a git
+> submodule. Like upstream, it is licensed under the Apache License 2.0; see `LICENSE` and
+> `NOTICE`. The rest of this README is upstream's.
+
  [![](https://dcbadge.limes.pink/api/server/https://discord.gg/6xWPKhGDbA)](https://discord.gg/6xWPKhGDbA)
 [![Docs](https://img.shields.io/badge/Docs-000000?style=for-the-badge&logo=mdbook&color=105864)](https://harborframework.com/docs)
 [![Cookbook](https://img.shields.io/badge/Cookbook-000000?style=for-the-badge&logo=mdbook&color=105864)](https://github.com/harbor-framework/harbor-cookbook)

@@ -25,6 +25,25 @@ class EnvironmentCapabilities(BaseModel):
     docker_compose: bool = False
     """Whether the environment can run Docker Compose task environments."""
 
+    serves: bool = False
+    """Whether the environment can expose a service port and provide endpoint()."""
+
+    can_commit: bool = False
+    """Whether a running environment can be snapshotted to a reusable image."""
+
+    gpu_pinning: bool = False
+    """Whether specific GPU device IDs can be pinned (vs. requesting a count)."""
+
+    egress_allowlist: bool = False
+    """Whether the environment can seal a sandbox to an egress allowlist (a
+    dual-homed proxy sidecar on Docker, an outbound CIDR allowlist on Modal),
+    permitting only specified destinations while blocking all other egress."""
+
+    overlay_dirs: bool = False
+    """Whether a launched container's writable layer can be a host directory, with
+    read-only directories stacked under it (``LaunchSpec.overlay_dir`` and
+    ``lower_overlay_dirs``)."""
+
 
 class EnvironmentResourceCapabilities(BaseModel):
     cpu_limit: bool = False

@@ -1,0 +1,9 @@
+Harbor, HLS fork
+
+This product is a modified version of Harbor, by the Harbor Framework Team
+(https://github.com/harbor-framework/harbor), licensed under the Apache License,
+Version 2.0.
+
+The HLS authors changed files of the original work. All of their changes are in
+the commit that follows upstream commit 6a7b64fd82610e9e2cecaeea3212f14b5f5066d6
+in this repository's history.

@@ -1,13 +1,20 @@
+import asyncio
 import json
 import os
+import re
 import shlex
+import time
+from collections import Counter
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from harbor.agents.installed.base import (
     BaseInstalledAgent,
     CliFlag,
     EnvVar,
+    NonZeroAgentExitCodeError,
     with_prompt_template,
 )
 from harbor.environments.base import BaseEnvironment
@@ -24,6 +31,150 @@ from harbor.models.trajectories import (
     Trajectory,
 )
 from harbor.models.trial.paths import EnvironmentPaths
+from harbor.utils.jsonl import json_objects
+
+
+# The brief the agent actually reads: a markdown file in the harness's WORKING
+# DIRECTORY, so it sits beside the code the agent is writing and is discoverable the
+# same way a README is. It must never ride the long-lived claude process's argv -- the
+# brief names server.py many times, so the agent's own `pkill -f server.py` (it restarts
+# its dev server constantly) would match the `claude` process and SIGTERM it mid-run.
+WORKSPACE_DIR = "/workspace"
+WORKSPACE_BRIEF_PATH = f"{WORKSPACE_DIR}/BRIEF.md"
+# The PERSISTED copy of that exact file. /logs/agent is a mount, so anything written
+# here lands in the rollout's build/agent/ record; it is produced by copying
+# WORKSPACE_BRIEF_PATH rather than re-rendering, so the persisted bytes are the bytes
+# the agent was given, by construction.
+BRIEF_PATH = "/logs/agent/brief.md"
+# The stream-json stdin: ONE user message, the /goal kickoff. The brief is not a message
+# -- everything after a leading /goal is goal text (capped at 4000 chars), so a brief
+# there would be rejected outright; the goal names the workspace file instead.
+MESSAGES_PATH = "/logs/agent/messages.jsonl"
+# The stream-json tee of every invocation's stdout. The first invocation truncates it and
+# each re-entry appends to it, so it holds the whole run's stream in order.
+STREAM_PATH = "/logs/agent/claude-code.txt"
+# The PID of the `claude` invocation now running, written by its launcher. A re-entry
+# waits for that process to be gone, so two invocations never share the session.
+PID_PATH = "/logs/agent/claude.pid"
+# A re-entry's message, read on stdin. Written by a short-lived exec rather than put on
+# argv, for the reason the brief is.
+REENTRY_PROMPT_PATH = "/logs/agent/reentry-prompt.txt"
+# The type of the line each re-entry's launcher writes into STREAM_PATH before the
+# resumed `claude` starts, so the tee shows where one process's events end. Result events
+# report total_cost_usd as a running total of the process that wrote them, and a resumed
+# session is a new process that starts again at zero.
+REENTRY_MARKER_TYPE = "harbor_reentry"
+
+# The bounds on re-entry (see ClaudeCode._drive). A session that ends with less than this
+# much budget left stays ended: a new invocation would spend it starting up.
+REENTRY_FLOOR_SEC = 300.0
+# A re-entry that ends this soon after it started made no progress, and this many of
+# those in a row end the loop: a session that ends at once on every resume will go on
+# doing so. The count covers nonzero exits too, so an invocation that fails the moment it
+# starts runs at most 1 + REENTRY_MAX_FAST_EXITS times and then ends the run as it
+# always did.
+REENTRY_FAST_EXIT_SEC = 60.0
+REENTRY_MAX_FAST_EXITS = 3
+# Seconds to wait before re-entering after a nonzero exit, doubled for each fast exit
+# before it. The model host that just failed a call may still be down, and re-entering at
+# once would spend REENTRY_MAX_FAST_EXITS in seconds.
+REENTRY_ERROR_PAUSE_SEC = 30.0
+# How much of the CLI's error text an event carries.
+_ERROR_TEXT_CHARS = 300
+# The longest stream line read back for that text. Longer lines are tool output or model
+# text, never the CLI's own error.
+_TAIL_LINE_CHARS = 2000
+# The characters of a stream line _read_exit parses for the init and result events. Those
+# events were measured at up to 1,934 and 10,790 bytes; a longer line, cut here, is unreadable.
+_EVENT_LINE_CHARS = 65_536
+# The bytes of a stream line the cost reader parses; it needs only result events.
+_STREAM_LINE_BYTES = 1 << 20
+# The bytes of a session transcript line the trajectory reader parses. The longest
+# measured held 259 KB; the rest is room for an image read.
+_SESSION_LINE_BYTES = 4 << 20
+# A result's subtype or terminal_reason as Claude Code writes one: a short word. Anything
+# else read from the stream, which the agent's commands can write, is no value.
+_RESULT_WORD = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
+# How often a re-entry checks whether the previous invocation's process is gone.
+_EXIT_POLL_SEC = 5
+# Result subtypes for a cap the CLI enforced on the harness's behalf (--max-turns,
+# --max-budget-usd). A resume would start the cap's count again, so the loop stops.
+_CAP_SUBTYPES = frozenset({"error_max_turns", "error_max_budget_usd"})
+# Session ids are lowercase UUIDs, as Claude Code writes them. The stream they are read from can
+# be written by the agent's own commands, so nothing else read out of it is put in a command, an
+# event or a log line.
+_SESSION_ID = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+)
+
+
+@dataclass(frozen=True)
+class SessionReentry:
+    """What run() needs to resume a session that exited with wall-clock budget left.
+
+    The /goal Stop hook is meant to keep a headless session going until its goal is met,
+    but in ``--print`` mode it lets the stop through in two ways: it is skipped when a
+    background shell is still running at the stop, and its evaluator call has a fixed
+    30 s timeout. Either ends the process hours before the budget. A failed model call
+    ends it too: when the host drops a stream mid-reply, the CLI reports "API Error:
+    upstream stream disconnected" and exits 1 with its session intact. With this set,
+    run() resumes the same session after every exit, clean or not, until the budget is
+    nearly spent. The caller owns the budget and the wording. This module owns the
+    mechanics and the ``REENTRY_*`` bounds.
+    """
+
+    #: Seconds of the run's wall-clock budget left now. Read after every exit.
+    remaining_sec: Callable[[], float]
+    #: The message a resumed session receives, given the seconds left. Plain prose, not
+    #: a /goal: the goal armed at kickoff is part of the session and survives a resume.
+    prompt: Callable[[float], str]
+    #: Called with ``("reentered", fields)`` just before each re-entry, and once with
+    #: ``("session_ended", fields)`` when an exit is not re-entered. After a nonzero exit
+    #: that is not re-entered, run() then raises the exit's NonZeroAgentExitCodeError.
+    on_event: Callable[[str, dict[str, Any]], None]
+
+
+@dataclass(frozen=True)
+class _Exit:
+    """What one finished invocation left in the stream tee."""
+
+    #: The tee's size in bytes after the invocation. The next invocation's stream
+    #: starts at this offset.
+    stream_end: int
+    #: The session the invocation ran, from its last result event or else its init
+    #: event. None when it wrote neither.
+    session_id: str | None
+    #: The subtype of its last result event ("success", "error_max_turns", ...), or None
+    #: when it wrote none or it is no word _RESULT_WORD matches. A failed model call is
+    #: still "success".
+    result_subtype: str | None
+    #: The ``terminal_reason`` of that result event ("api_error", ...), or None, under the
+    #: same rule.
+    terminal_reason: str | None
+    #: What the CLI said went wrong, at most _ERROR_TEXT_CHARS: the result text of a
+    #: result event marked ``is_error``, else, after a nonzero exit, the last line the
+    #: process printed that is not a stream event. None when there is neither.
+    error: str | None
+
+
+def _result_word(value: Any) -> str | None:
+    """*value* when _RESULT_WORD matches it whole, else None."""
+    return value if isinstance(value, str) and _RESULT_WORD.fullmatch(value) else None
+
+
+def _stop_reason(ended: _Exit, remaining: float, fast_exits: int) -> str | None:
+    """Why the session an invocation left as ``ended`` is not re-entered, with
+    ``remaining`` seconds of budget left after ``fast_exits`` fast re-entries in a row,
+    or None when it may be. Whether its transcript is on disk is checked later."""
+    if ended.result_subtype in _CAP_SUBTYPES:
+        return "cap_reached"
+    if remaining <= REENTRY_FLOOR_SEC:
+        return "budget_spent"
+    if fast_exits >= REENTRY_MAX_FAST_EXITS:
+        return "fast_exits"
+    if ended.session_id is None:
+        return "no_session"
+    return None
 
 
 class ClaudeCode(BaseInstalledAgent):
@@ -106,10 +257,44 @@ class ClaudeCode(BaseInstalledAgent):
         logs_dir: Path,
         memory_dir: str | None = None,
         *args,
+        inherit_process_env: bool = True,
+        ralph_kickoff: str | None = None,
+        reentry: SessionReentry | None = None,
+        secret_env: Sequence[str] = (),
+        secret_forms: Callable[[str, str], Iterable[str]] = lambda _name, value: (
+            value,
+        ),
         **kwargs,
     ):
         self.memory_dir = memory_dir
+        # When set, an exit with budget left resumes the same session (see
+        # SessionReentry). None keeps the single invocation.
+        self._reentry = reentry
+        # Optional second user message sent right after the instruction via
+        # stream-json input. Slash commands are recognized per message, so a
+        # "/goal ..." here arms Claude Code's goal loop with the instruction
+        # delivered as its own clean first message (see run()).
+        self._ralph_kickoff = ralph_kickoff
+        # When False, do NOT forward the orchestrator's process credentials/config
+        # (ANTHROPIC_API_KEY / BASE_URL / AUTH_TOKEN, OAuth, Bedrock, host DISABLE_*
+        # vars) into the agent's run env. The agent then inherits ONLY the env its
+        # sandbox container was launched with. Used by sealed evaluation harnesses
+        # (e.g. HLS) that supply a closed, explicit agent env and must not leak
+        # ambient shell state into it.
+        self._inherit_process_env = inherit_process_env
         super().__init__(logs_dir, *args, **kwargs)
+        missing = sorted(set(secret_env) - set(self._extra_env))
+        if missing:
+            raise ValueError(
+                f"secret_env names variables extra_env does not hold: {missing}"
+            )
+        # The variables of extra_env whose values are secrets. A session id read from the
+        # stream that holds a form of one of them is not resumed.
+        self._secret_env = tuple(secret_env)
+        # The texts a secret variable's value appears as, by its name and value: the value
+        # alone by default. The caller's rule gives the rest (hls: the host of a URL that
+        # identifies a machine), the one its scrubber redacts by.
+        self._secret_forms = secret_forms
 
     def get_version_command(self) -> str | None:
         return 'export PATH="$HOME/.local/bin:$PATH"; claude --version'
@@ -125,6 +310,24 @@ class ClaudeCode(BaseInstalledAgent):
         return text
 
     async def install(self, environment: BaseEnvironment) -> None:
+        # Idempotent: when claude-code is already on PATH and no specific version is
+        # pinned (e.g. a build image that bakes it -- the sealed-eval / HLS case), skip
+        # the re-install entirely. The install path below fetches
+        # ``https://claude.ai/install.sh`` via an UNBOUNDED ``curl | bash``;
+        # re-downloading it on every run is wasteful and, when that host is slow or
+        # unreachable from inside a sealed sandbox, hangs the whole setup indefinitely
+        # (no timeout). The probe runs as the agent user; ``exec_as_agent`` raises on a
+        # nonzero exit, so "not found" lands in the except and falls through to install.
+        if self._version is None:
+            try:
+                await self.exec_as_agent(
+                    environment,
+                    command='export PATH="$HOME/.local/bin:$PATH"; command -v claude',
+                )
+                return
+            except RuntimeError:
+                pass  # claude-code not present -> install it below
+
         # Install system packages (root)
         await self.exec_as_root(
             environment,
@@ -141,7 +344,8 @@ class ClaudeCode(BaseInstalledAgent):
             ),
             env={"DEBIAN_FRONTEND": "noninteractive"},
         )
-        # Install claude-code (as default user)
+        # Install claude-code (as default user). The curl is bounded (connect + total)
+        # so an unreachable claude.ai fails fast instead of hanging setup with no timeout.
         version_flag = f" {self._version}" if self._version else ""
         await self.exec_as_agent(
             environment,
@@ -150,7 +354,8 @@ class ClaudeCode(BaseInstalledAgent):
                 "if command -v apk &> /dev/null; then"
                 f"  npm install -g @anthropic-ai/claude-code{'@' + self._version if self._version else ''};"
                 " else"
-                f"  curl -fsSL https://claude.ai/install.sh | bash -s --{version_flag};"
+                "  curl --connect-timeout 20 --max-time 300 -fsSL https://claude.ai/install.sh"
+                f" | bash -s --{version_flag};"
                 " fi && "
                 "echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> ~/.bashrc && "
                 'export PATH="$HOME/.local/bin:$PATH" && '
@@ -488,35 +693,36 @@ class ClaudeCode(BaseInstalledAgent):
         return (result_text or None), metadata
 
     def _parse_total_cost_from_stream_json(self) -> float | None:
-        """Extract authoritative `total_cost_usd` from Claude Code's stdout stream.
+        """The run's cost from the ``total_cost_usd`` of the result events Claude
+        Code's ``--output-format=stream-json`` mode writes to the tee at
+        ``<logs_dir>/claude-code.txt``.
 
-        Claude Code's `--output-format=stream-json --print` mode emits a final
-        ``{"type":"result", ..., "total_cost_usd": <float>, ...}`` line to stdout,
-        which Harbor tees to ``<logs_dir>/claude-code.txt``. Returns ``None`` if
-        the file is missing, malformed, or the result event lacks the field.
-        """
+        The figure is a running total of the process that wrote it, one result event
+        per query the process ran, so each process's last figure is what that process
+        spent. The REENTRY_MARKER_TYPE lines separate the processes of a re-entered
+        session, and the run's cost is the sum of their last figures. Returns ``None``
+        if the file is missing or no result event carries the field."""
         stream_path = self.logs_dir / "claude-code.txt"
+        # One entry per process: its latest total_cost_usd, None until it reports one.
+        totals: list[float | None] = [None]
         try:
-            content = stream_path.read_text(encoding="utf-8")
+            for event in json_objects(
+                stream_path, max_line_bytes=_STREAM_LINE_BYTES, logger=self.logger
+            ):
+                if event.get("type") == REENTRY_MARKER_TYPE:
+                    totals.append(None)
+                elif event.get("type") == "result":
+                    value = event.get("total_cost_usd")
+                    if value is None:
+                        continue
+                    try:
+                        totals[-1] = float(value)
+                    except (TypeError, ValueError):
+                        continue
         except OSError:
             return None
-        for line in content.splitlines():
-            line = line.strip()
-            if not line or not line.startswith("{"):
-                continue
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if event.get("type") == "result":
-                cost = event.get("total_cost_usd")
-                if cost is None:
-                    return None
-                try:
-                    return float(cost)
-                except (TypeError, ValueError):
-                    return None
-        return None
+        reported = [total for total in totals if total is not None]
+        return sum(reported) if reported else None
 
     def _convert_events_to_trajectory(self, session_dir: Path) -> Trajectory | None:
         """Convert Claude session into an ATIF trajectory."""
@@ -528,22 +734,20 @@ class ClaudeCode(BaseInstalledAgent):
 
         raw_events: list[dict[str, Any]] = []
         for session_file in session_files:
-            with open(session_file, "r") as handle:
-                for line in handle:
-                    stripped = line.strip()
-                    if not stripped:
-                        continue
-                    try:
-                        raw_events.append(json.loads(stripped))
-                    except json.JSONDecodeError as exc:
-                        self.logger.debug(
-                            f"Skipping malformed JSONL line in {session_file}: {exc}"
-                        )
+            raw_events.extend(
+                json_objects(
+                    session_file,
+                    max_line_bytes=_SESSION_LINE_BYTES,
+                    logger=self.logger,
+                )
+            )
 
         if not raw_events:
             return None
 
-        raw_events.sort(key=lambda e: e.get("timestamp", ""))
+        raw_events.sort(
+            key=lambda e: t if isinstance(t := e.get("timestamp"), str) else ""
+        )
         events = [event for event in raw_events if event.get("isSidechain")] + [
             event for event in raw_events if not event.get("isSidechain")
         ]
@@ -821,9 +1025,15 @@ class ClaudeCode(BaseInstalledAgent):
             normalized_events.append(leftover_call)
 
         steps: list[Step] = []
-        for idx, norm_event in enumerate(normalized_events, start=1):
+        for norm_event in normalized_events:
             try:
-                step = self._convert_event_to_step(norm_event, idx)
+                # Numbered by how many steps have survived, not by position in the input.
+                # ATIF requires step_id sequential from 1, and events are dropped here --
+                # an orphan tool result whose tool_use never arrived carries no tool name
+                # and cannot become a step. Numbering by input position leaves a hole at
+                # each drop and the whole Trajectory then fails validation, losing the
+                # trajectory, the cost and the step count for the run.
+                step = self._convert_event_to_step(norm_event, len(steps) + 1)
             except ValueError as exc:
                 self.logger.debug(f"Skipping event during step conversion: {exc}")
                 continue
@@ -919,15 +1129,16 @@ class ClaudeCode(BaseInstalledAgent):
         try:
             trajectory = self._convert_events_to_trajectory(session_dir)
         except Exception as exc:
-            self.logger.debug(
-                f"Failed to convert Claude Code events to trajectory: {exc}"
+            self.logger.warning(
+                f"Failed to convert the Claude Code events in {session_dir} to a "
+                f"trajectory: {exc!r}"
             )
             return
         if not trajectory:
             self.logger.debug("Failed to convert Claude Code session to trajectory")
             return
 
-        trajectory_path = self.logs_dir / "trajectory.json"
+        trajectory_path = (self.trajectory_dir or self.logs_dir) / "trajectory.json"
         try:
             with open(trajectory_path, "w", encoding="utf-8") as handle:
                 json.dump(
@@ -1012,60 +1223,90 @@ class ClaudeCode(BaseInstalledAgent):
             return True
         return False
 
-    @with_prompt_template
-    async def run(
-        self, instruction: str, environment: BaseEnvironment, context: AgentContext
-    ) -> None:
-        escaped_instruction = shlex.quote(instruction)
+    def _build_run_env(self) -> dict[str, str]:
+        """Build the environment dict forwarded into the claude CLI process.
 
-        use_bedrock = self._is_bedrock_mode()
+        Constructs the full env dict (auth, model, Bedrock, telemetry flags, etc.)
+        and strips empty-string values before returning.  ``run()`` calls this
+        method and then appends ``CLAUDE_CONFIG_DIR`` on top of the result.
+        """
+        use_bedrock = self._inherit_process_env and self._is_bedrock_mode()
 
+        # Functional flags always set, regardless of env-inheritance policy.
         env = {
-            "ANTHROPIC_API_KEY": os.environ.get("ANTHROPIC_API_KEY")
-            or os.environ.get("ANTHROPIC_AUTH_TOKEN")
-            or "",
-            "ANTHROPIC_BASE_URL": os.environ.get("ANTHROPIC_BASE_URL", None),
-            "CLAUDE_CODE_OAUTH_TOKEN": os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", ""),
-            "CLAUDE_CODE_MAX_OUTPUT_TOKENS": os.environ.get(
-                "CLAUDE_CODE_MAX_OUTPUT_TOKENS", None
-            ),
             "FORCE_AUTO_BACKGROUND_TASKS": "1",
             "ENABLE_BACKGROUND_TASKS": "1",
+            # Unattended eval-harness runs must wait out a transient API capacity/
+            # rate-limit outage rather than give up after the (now 15-capped) retry
+            # count and exit non-zero mid-build (which costs the run). The retry
+            # watchdog retries 429/529 capacity errors indefinitely with up to a
+            # 5-minute backoff. See CLAUDE_CODE_RETRY_WATCHDOG (Claude Code >= 2.1.186).
+            # Overridable (set to "0" to disable) for debugging.
+            "CLAUDE_CODE_RETRY_WATCHDOG": os.environ.get(
+                "CLAUDE_CODE_RETRY_WATCHDOG", "1"
+            ),
         }
 
-        # Bedrock configuration: pass through AWS credentials and region
-        if use_bedrock:
-            env["CLAUDE_CODE_USE_BEDROCK"] = "1"
-
-            # AWS Bedrock API key auth (Option E from Bedrock docs)
-            bedrock_token = os.environ.get("AWS_BEARER_TOKEN_BEDROCK", "")
-            if bedrock_token:
-                env["AWS_BEARER_TOKEN_BEDROCK"] = bedrock_token
-
-            # Standard AWS credential chain (Option B from Bedrock docs)
-            for aws_var in (
-                "AWS_ACCESS_KEY_ID",
-                "AWS_SECRET_ACCESS_KEY",
-                "AWS_SESSION_TOKEN",
-                "AWS_PROFILE",
-            ):
-                val = os.environ.get(aws_var, "")
-                if val:
-                    env[aws_var] = val
-
-            # AWS_REGION is required for Bedrock; default to us-east-1
-            env["AWS_REGION"] = os.environ.get("AWS_REGION", "us-east-1")
-
-            # Optional: separate region for the small/fast model (Haiku)
-            small_model_region = os.environ.get(
-                "ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION", ""
+        # Forward the orchestrator's process credentials/config into the agent ONLY
+        # when inheritance is enabled. A sealed harness (inherit_process_env=False)
+        # supplies the agent's credentials through its sandbox container env and must
+        # not leak ambient shell state into it.
+        if self._inherit_process_env:
+            env["ANTHROPIC_API_KEY"] = (
+                os.environ.get("ANTHROPIC_API_KEY")
+                or os.environ.get("ANTHROPIC_AUTH_TOKEN")
+                or ""
             )
-            if small_model_region:
-                env["ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION"] = small_model_region
+            env["ANTHROPIC_BASE_URL"] = os.environ.get("ANTHROPIC_BASE_URL", None)
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = os.environ.get(
+                "CLAUDE_CODE_OAUTH_TOKEN", ""
+            )
+            env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = os.environ.get(
+                "CLAUDE_CODE_MAX_OUTPUT_TOKENS", None
+            )
 
-            # Optional: disable prompt caching (not available in all regions)
-            if os.environ.get("DISABLE_PROMPT_CACHING", "").strip() == "1":
-                env["DISABLE_PROMPT_CACHING"] = "1"
+            # Bedrock configuration: pass through AWS credentials and region
+            if use_bedrock:
+                env["CLAUDE_CODE_USE_BEDROCK"] = "1"
+
+                # AWS Bedrock API key auth (Option E from Bedrock docs)
+                bedrock_token = os.environ.get("AWS_BEARER_TOKEN_BEDROCK", "")
+                if bedrock_token:
+                    env["AWS_BEARER_TOKEN_BEDROCK"] = bedrock_token
+
+                # Standard AWS credential chain (Option B from Bedrock docs)
+                for aws_var in (
+                    "AWS_ACCESS_KEY_ID",
+                    "AWS_SECRET_ACCESS_KEY",
+                    "AWS_SESSION_TOKEN",
+                    "AWS_PROFILE",
+                ):
+                    val = os.environ.get(aws_var, "")
+                    if val:
+                        env[aws_var] = val
+
+                # AWS_REGION is required for Bedrock; default to us-east-1
+                env["AWS_REGION"] = os.environ.get("AWS_REGION", "us-east-1")
+
+                # Optional: separate region for the small/fast model (Haiku)
+                small_model_region = os.environ.get(
+                    "ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION", ""
+                )
+                if small_model_region:
+                    env["ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION"] = small_model_region
+
+            # Forward caller-set host vars the Claude CLI understands, uniformly.
+            # DISABLE_PROMPT_CACHING is forwarded the same way as the telemetry-
+            # disable vars rather than being special-cased inside the Bedrock block.
+            for host_var in (
+                "DISABLE_PROMPT_CACHING",
+                "DISABLE_TELEMETRY",
+                "DISABLE_ERROR_REPORTING",
+                "DISABLE_BUG_COMMAND",
+            ):
+                val = os.environ.get(host_var, "").strip()
+                if val:
+                    env[host_var] = val
 
         # Remove empty auth credentials to allow Claude CLI to prioritize the available method
         # When both are empty, Claude CLI will fail with a clear authentication error
@@ -1087,7 +1328,7 @@ class ClaudeCode(BaseInstalledAgent):
             else:
                 # Strip provider prefix for official Anthropic API
                 env["ANTHROPIC_MODEL"] = self.model_name.split("/")[-1]
-        elif "ANTHROPIC_MODEL" in os.environ:
+        elif self._inherit_process_env and "ANTHROPIC_MODEL" in os.environ:
             env["ANTHROPIC_MODEL"] = os.environ["ANTHROPIC_MODEL"]
 
         # When using custom base URL, set all model aliases to the same model
@@ -1097,8 +1338,13 @@ class ClaudeCode(BaseInstalledAgent):
             env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = env["ANTHROPIC_MODEL"]
             env["CLAUDE_CODE_SUBAGENT_MODEL"] = env["ANTHROPIC_MODEL"]
 
-        # Disable adaptive thinking if requested
-        if os.environ.get("CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING", "").strip() == "1":
+        # Disable adaptive thinking if requested (host-env opt-in; skipped when not
+        # inheriting the orchestrator's process env).
+        if (
+            self._inherit_process_env
+            and os.environ.get("CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING", "").strip()
+            == "1"
+        ):
             env["CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING"] = "1"
 
         # Disable non-essential traffic (telemetry, etc.)
@@ -1110,6 +1356,16 @@ class ClaudeCode(BaseInstalledAgent):
         # Merge declarative env vars (e.g. MAX_THINKING_TOKENS)
         env.update(self._resolved_env_vars)
 
+        return env
+
+    @with_prompt_template
+    async def run(
+        self, instruction: str, environment: BaseEnvironment, context: AgentContext
+    ) -> None:
+        escaped_instruction = shlex.quote(instruction)
+
+        env = self._build_run_env()
+
         env["CLAUDE_CONFIG_DIR"] = (EnvironmentPaths.agent_dir / "sessions").as_posix()
 
         setup_command = (
@@ -1118,7 +1374,16 @@ class ClaudeCode(BaseInstalledAgent):
             "$CLAUDE_CONFIG_DIR/todos $CLAUDE_CONFIG_DIR/skills && "
             "if [ -d ~/.claude/skills ]; then "
             "cp -r ~/.claude/skills/. $CLAUDE_CONFIG_DIR/skills/ 2>/dev/null || true; "
-            "fi"
+            "fi && "
+            # Pre-seed a CUDA/PTX kernel skill baked into the build image at /opt/cuda_skill
+            # (if present), so the agent has the PTX ISA + CUDA API + nsys/ncu references
+            # in-session when building kernels from scratch.
+            "if [ -d /opt/cuda_skill ]; then "
+            'cp -r /opt/cuda_skill "$CLAUDE_CONFIG_DIR/skills/cuda" 2>/dev/null || true; '
+            "fi && "
+            # The git_repo submission contract requires the agent's work on `main`; make
+            # `git init` create `main` (plain git would default to `master`).
+            "git config --global init.defaultBranch main"
         )
 
         skills_command = self._build_register_skills_command()
@@ -1141,15 +1406,314 @@ class ClaudeCode(BaseInstalledAgent):
             command=setup_command,
             env=env,
         )
+        # Write the brief to a file in a SHORT-LIVED exec, then run the agent reading
+        # from stdin. The brief must never appear in the long-lived agent process's
+        # argv: it mentions "server.py" many times, so the agent's own `pkill -f
+        # server.py` (it restarts its dev server constantly) would otherwise match the
+        # `claude` process and SIGTERM it (exit 143) mid-run.
+        #
+        # With a ralph kickoff, stdin is stream-json carrying TWO user messages: the
+        # instruction, then the kickoff. They cannot share one message: plain stdin
+        # and an argv prompt are appended into a single message, where a leading
+        # /goal makes everything after it goal text -- capped at 4000 chars, so a
+        # full brief there is rejected outright.
+        # Write the brief into the harness's working directory, then copy it to the
+        # persisted location -- `cp`, not a second render, so the recorded file and the
+        # agent's file cannot drift.
         await self.exec_as_agent(
             environment,
             command=(
-                'export PATH="$HOME/.local/bin:$PATH"; '
-                f"claude --verbose --output-format=stream-json "
-                f"--permission-mode=bypassPermissions "
-                f"{extra_flags}"
-                f"--print -- {escaped_instruction} 2>&1 </dev/null | tee "
-                f"/logs/agent/claude-code.txt"
+                f"mkdir -p /logs/agent {WORKSPACE_DIR} "
+                f"&& printf '%s' {escaped_instruction} > {WORKSPACE_BRIEF_PATH} "
+                f"&& cp {WORKSPACE_BRIEF_PATH} {BRIEF_PATH}"
             ),
             env=env,
+        )
+        if self._ralph_kickoff is not None:
+            # ONE message: the /goal kickoff. It names the workspace brief, which is how
+            # the agent gets the task -- the brief is a file to read, not a message.
+            messages = shlex.quote(self._kickoff_messages())
+            await self.exec_as_agent(
+                environment,
+                command=f"printf '%s' {messages} > {MESSAGES_PATH}",
+                env=env,
+            )
+            first = (f"{extra_flags}--input-format=stream-json --print ", MESSAGES_PATH)
+        else:
+            first = (f"{extra_flags}--print ", WORKSPACE_BRIEF_PATH)
+        await self._drive(environment, env, extra_flags, first)
+
+    @staticmethod
+    def _launch_command(flags: str, stdin_path: str, *, reentry: int) -> str:
+        """One `claude` invocation reading ``stdin_path``, teed to STREAM_PATH.
+
+        ``reentry`` numbers the invocation among the run's re-entries, 0 for the first
+        invocation, which truncates the tee. A re-entry appends to it, after a
+        REENTRY_MARKER_TYPE line. The subshell writes its PID to PID_PATH and then
+        execs claude in its place, so the recorded PID is claude's own."""
+        launch = (
+            'export PATH="$HOME/.local/bin:$PATH"; '
+            f"(echo $BASHPID > {PID_PATH}; exec claude --verbose "
+            f"--output-format=stream-json --permission-mode=bypassPermissions "
+            f"{flags}< {stdin_path}) 2>&1 | "
+        )
+        if reentry == 0:
+            return f"{launch}tee {STREAM_PATH}"
+        marker = json.dumps({"type": REENTRY_MARKER_TYPE, "reentry": reentry})
+        return (
+            f"printf '%s\\n' {shlex.quote(marker)} >> {STREAM_PATH}; "
+            f"{launch}tee -a {STREAM_PATH}"
+        )
+
+    async def _drive(
+        self,
+        environment: BaseEnvironment,
+        env: dict[str, str],
+        extra_flags: str,
+        first: tuple[str, str],
+    ) -> None:
+        """Run the first invocation, then re-enter its session while SessionReentry
+        allows.
+
+        ``first`` is the first invocation's flags (ending in ``--print``) and the file
+        it reads on stdin. An exit is re-entered whether it was clean or not, under the
+        same bounds. A nonzero exit waits REENTRY_ERROR_PAUSE_SEC first, and one that is
+        not re-entered raises its NonZeroAgentExitCodeError, as every nonzero exit did
+        without re-entry. A harness cut cancels this coroutine, so it cannot start
+        another invocation. Each invocation is awaited to its end and each re-entry first
+        waits for the previous PID to be gone, so at most one `claude` runs at a time."""
+        flags, stdin_path = first
+        stream_start = 0
+        reentries = 0
+        fast_exits = 0
+        while True:
+            started = time.monotonic()
+            failure: NonZeroAgentExitCodeError | None = None
+            try:
+                await self.exec_as_agent(
+                    environment,
+                    command=self._launch_command(flags, stdin_path, reentry=reentries),
+                    env=env,
+                )
+            except NonZeroAgentExitCodeError as exc:
+                if self._reentry is None:
+                    raise
+                failure = exc
+            ran_sec = time.monotonic() - started
+            if self._reentry is None:
+                return
+            if reentries > 0:
+                fast_exits = fast_exits + 1 if ran_sec < REENTRY_FAST_EXIT_SEC else 0
+            try:
+                ended = await self._read_exit(
+                    environment, env, stream_start, failed=failure is not None
+                )
+                stream_start = ended.stream_end
+                remaining = self._reentry.remaining_sec()
+                reason = _stop_reason(ended, remaining, fast_exits)
+                paused = 0.0
+                if reason is None and failure is not None:
+                    paused = REENTRY_ERROR_PAUSE_SEC * 2**fast_exits
+                    await asyncio.sleep(paused)
+                    remaining = self._reentry.remaining_sec()
+                    reason = _stop_reason(ended, remaining, fast_exits)
+                fields: dict[str, Any] = {
+                    "session_id": ended.session_id,
+                    "result_subtype": ended.result_subtype,
+                    "exit_code": 0 if failure is None else failure.return_code,
+                    "terminal_reason": ended.terminal_reason,
+                    "error": ended.error,
+                    "invocation_sec": round(ran_sec, 1),
+                    "paused_sec": paused,
+                    "remaining_sec": round(remaining, 1),
+                    "reentries": reentries,
+                    "fast_exits": fast_exits,
+                }
+                waited: int | None = None
+                if reason is None and ended.session_id is not None:
+                    waited = await self._prepare_reentry(
+                        environment,
+                        env,
+                        ended.session_id,
+                        self._reentry.prompt(remaining),
+                    )
+                    reason = "no_session" if waited is None else None
+            except Exception:
+                # After a nonzero exit, a failure to look at it (the sandbox may be gone)
+                # must not replace the exit the build collects after.
+                if failure is None:
+                    raise
+                self.logger.warning(
+                    "claude exited nonzero and the exit could not be examined; "
+                    "not re-entered",
+                    exc_info=True,
+                )
+                raise failure
+            if reason is not None:
+                self.logger.info(
+                    f"claude session ended, not re-entered ({reason}): {fields}"
+                )
+                self._reentry.on_event("session_ended", {"reason": reason, **fields})
+                if failure is not None:
+                    raise failure
+                return
+            reentries += 1
+            fields.update(reentries=reentries, waited_sec=waited)
+            self.logger.info(f"re-entering the claude session: {fields}")
+            self._reentry.on_event("reentered", fields)
+            flags = f"{extra_flags}--resume {ended.session_id} --print "
+            stdin_path = REENTRY_PROMPT_PATH
+
+    async def _read_exit(
+        self,
+        environment: BaseEnvironment,
+        env: dict[str, str],
+        stream_start: int,
+        *,
+        failed: bool,
+    ) -> _Exit:
+        """Read what the invocation whose stream starts at byte ``stream_start`` left in
+        the tee: the first lines of its stream, where its init event is, its last few
+        lines that mention a result, and its last few lines. They are parsed here rather
+        than grepped for fields, so key order and spacing do not matter. ``failed`` says
+        the invocation exited nonzero, which is when a stray last line is its error.
+
+        The agent's commands can write the stream, so each line is cut to
+        _EVENT_LINE_CHARS before it is parsed, a line the decoder refuses for any reason
+        is unreadable and counted in a warning, and the exit is judged on the rest."""
+        segment = f"tail -c +{stream_start + 1} {STREAM_PATH} 2>/dev/null"
+        result = await self.exec_as_agent(
+            environment,
+            command=(
+                f'echo "size $(stat -c %s {STREAM_PATH} 2>/dev/null || echo 0)"; '
+                f"{segment} | head -n 20 | cut -c1-{_EVENT_LINE_CHARS} "
+                "| sed 's/^/head /'; "
+                f"{segment} | grep '\"result\"' | tail -n 5 "
+                f"| cut -c1-{_EVENT_LINE_CHARS} | sed 's/^/result /'; "
+                f"{segment} | tail -n 5 | cut -c1-{_TAIL_LINE_CHARS} | sed 's/^/tail /'; "
+                "true"
+            ),
+            env=env,
+        )
+        size = stream_start
+        init: dict[str, Any] = {}
+        last_result: dict[str, Any] = {}
+        last_text: str | None = None
+        unreadable: Counter[str] = Counter()
+        for line in (result.stdout or "").splitlines():
+            tag, _, rest = line.partition(" ")
+            if tag == "size" and rest.strip().isdigit():
+                size = int(rest.strip())
+                continue
+            if tag == "tail":
+                # Stream events are JSON objects; anything else is the CLI's own output.
+                if rest.strip() and not rest.lstrip().startswith("{"):
+                    last_text = rest.strip()
+                continue
+            try:
+                event = json.loads(rest)
+            except Exception:  # noqa: BLE001 -- the agent's commands can write the stream
+                event = None
+            if not isinstance(event, dict):
+                if tag in ("head", "result") and rest.strip():
+                    unreadable[tag] += 1
+                continue
+            if tag == "head" and not init and event.get("subtype") == "init":
+                init = event
+            elif tag == "result" and event.get("type") == "result":
+                last_result = event
+        if unreadable:
+            self.logger.warning(
+                f"{sum(unreadable.values())} lines of claude's stream could not be read "
+                f"as events ({dict(unreadable)}, each cut to {_EVENT_LINE_CHARS} "
+                "characters); they are no evidence"
+            )
+        session_id = last_result.get("session_id") or init.get("session_id")
+        if (
+            not isinstance(session_id, str)
+            or not _SESSION_ID.fullmatch(session_id)
+            or self._holds_secret(session_id)
+        ):
+            session_id = None
+        subtype = last_result.get("subtype")
+        terminal = last_result.get("terminal_reason")
+        error = (
+            last_result.get("result") if last_result.get("is_error") is True else None
+        )
+        if not isinstance(error, str) or not error.strip():
+            error = last_text if failed else None
+        return _Exit(
+            stream_end=size,
+            session_id=session_id,
+            result_subtype=_result_word(subtype),
+            terminal_reason=_result_word(terminal),
+            error=error.strip()[:_ERROR_TEXT_CHARS] if error else None,
+        )
+
+    def _holds_secret(self, text: str) -> bool:
+        """Whether *text* holds, in any case, a form of the value of a ``secret_env`` variable,
+        as ``secret_forms`` gives them: an API key can itself be shaped as a session id.
+        Plain settings, such as an output limit, are not compared."""
+        folded = text.lower()
+        for name in self._secret_env:
+            value = self._extra_env[name]
+            if not value:
+                continue
+            if any(
+                form and form.lower() in folded
+                for form in self._secret_forms(name, value)
+            ):
+                return True
+        return False
+
+    async def _prepare_reentry(
+        self,
+        environment: BaseEnvironment,
+        env: dict[str, str],
+        session_id: str,
+        prompt: str,
+    ) -> int | None:
+        """Get a re-entry ready: confirm the session's transcript is on disk, wait for
+        the previous invocation's process to be gone, and write the prompt.
+
+        Returns the seconds spent waiting, or None when the transcript is missing and a
+        resume would have nothing to load. The wait has no bound of its own: a previous
+        process still alive is still doing the run's work, and the harness's cut ends
+        it."""
+        result = await self.exec_as_agent(
+            environment,
+            command=(
+                f'if ! ls "$CLAUDE_CONFIG_DIR"/projects/*/{session_id}.jsonl '
+                ">/dev/null 2>&1; then echo missing; exit 0; fi; "
+                f"pid=$(cat {PID_PATH} 2>/dev/null); t0=$(date +%s); "
+                'while [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null '
+                '&& grep -qa stream-json "/proc/$pid/cmdline" 2>/dev/null; '
+                f"do sleep {_EXIT_POLL_SEC}; done; "
+                'echo "waited $(( $(date +%s) - t0 ))"; '
+                f"printf '%s' {shlex.quote(prompt)} > {REENTRY_PROMPT_PATH}"
+            ),
+            env=env,
+        )
+        for line in (result.stdout or "").splitlines():
+            tag, _, rest = line.partition(" ")
+            if tag == "waited" and rest.strip().isdigit():
+                return int(rest.strip())
+        return None
+
+    def _kickoff_messages(self) -> str:
+        """stream-json input: the kickoff as the SINGLE user message.
+
+        The instruction is deliberately absent -- it is the workspace brief file the
+        kickoff names. Sending it as a message too would either duplicate the whole
+        brief into the transcript or (worse, when concatenated with a leading /goal)
+        be swallowed as goal text and truncated at 4000 chars.
+        """
+        return (
+            json.dumps(
+                {
+                    "type": "user",
+                    "message": {"role": "user", "content": self._ralph_kickoff},
+                }
+            )
+            + "\n"
         )

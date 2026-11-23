@@ -10,15 +10,15 @@ Usage (inside container):
 """
 
 import argparse
-import asyncio
+import errno
 import inspect
 import logging
 import os
 import shutil
-import signal
 import subprocess
 import sys
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Dict, Optional
 
 import uvicorn
@@ -176,17 +176,20 @@ async def health_check():
     return {"status": "ok"}
 
 
-@app.post("/shutdown")
-async def shutdown():
-    """Trigger server shutdown."""
-    logger.info("Shutdown requested via API")
-
-    async def delayed_shutdown():
-        await asyncio.sleep(0.1)
-        os.kill(os.getpid(), signal.SIGTERM)
-
-    asyncio.create_task(delayed_shutdown())
-    return {"message": "Shutdown initiated"}
+# The server has no route that stops it: the host tears the sandbox down by killing this
+# process directly (`SingularityEnvironment.stop`).
+#
+# This process runs under `singularity exec --pid`, and bootstrap.sh `exec`s into it, so it
+# is pid 1 of the container's PID namespace -- when it exits the kernel SIGKILLs every other
+# process there. Any code the agent runs shares that namespace and can reach this server
+# (a unix socket at /staging/control.sock when sealed, 127.0.0.1 otherwise), so a route
+# that stopped it would let the agent end the sandbox with no crash, no traceback and no
+# kernel event.
+#
+# SIGKILL is not the same hazard: the kernel discards signals sent to a namespace's pid 1
+# by a member of that namespace unless pid 1 handles them, so an agent's `pkill -9` cannot
+# reach this process (the kill syscall even returns success, so the caller believes it
+# worked). SIGTERM is delivered because uvicorn installs a handler for it.
 
 
 # =============================================================================
@@ -291,8 +294,17 @@ def setup_common_directories() -> None:
     for directory in directories:
         try:
             os.makedirs(directory, exist_ok=True)
-        except FileExistsError:
-            logger.debug("Skip creating %s (exists and is not a directory)", directory)
+        except OSError as e:
+            # Under the rootless producer seal the container root is read-only (no writable
+            # overlay in a nested userns on older kernels), so promoting these convenience
+            # dirs fails with EINVAL / EROFS / EACCES -- that must not crash the server.
+            # Writable space comes from binds (/workspace, /staging) + tmpfs (/tmp, $HOME).
+            # Only swallow the expected read-only/permission errors; re-raise anything
+            # unexpected (ENOSPC, EIO, etc.) so genuine faults fail loudly.
+            if e.errno in (errno.EINVAL, errno.EROFS, errno.EACCES, errno.EPERM):
+                logger.debug("Skip creating %s: %s", directory, e)
+            else:
+                raise
 
     logger.debug("Created common directories")
 
@@ -304,14 +316,15 @@ def setup_fake_sudo() -> None:
     but some scripts expect it to exist.
     """
     sudo_path = "/usr/local/bin/sudo"
-    os.makedirs(os.path.dirname(sudo_path), exist_ok=True)
-
-    with open(sudo_path, "w") as f:
-        f.write("#!/bin/bash\n")
-        f.write('exec "$@"\n')
-    os.chmod(sudo_path, 0o755)
-
-    logger.debug("Created fake sudo")
+    try:
+        os.makedirs(os.path.dirname(sudo_path), exist_ok=True)
+        Path(sudo_path).write_text('#!/bin/bash\nexec "$@"\n')
+        os.chmod(sudo_path, 0o755)
+        logger.debug("Created fake sudo")
+    except OSError as e:
+        # Read-only root under the producer seal (see setup_common_directories): a build
+        # that needs sudo is out of scope for the sealed sandbox; don't crash the server.
+        logger.debug("Skip fake sudo: %s", e)
 
 
 def setup_apt_sources() -> None:
@@ -398,13 +411,27 @@ def main():
     parser = argparse.ArgumentParser(
         description="FastAPI server for Singularity container"
     )
-    parser.add_argument("--port", type=int, required=True, help="Port to listen on")
+    # The control channel is TCP loopback by default, but a UNIX socket when the producer
+    # seal is active: under the rootless egress seal the container runs in a private network
+    # namespace (its own loopback), so the host cannot reach a TCP server on 127.0.0.1 --
+    # a UDS on the bind-mounted staging dir is reachable across the netns boundary.
+    parser.add_argument("--port", type=int, default=None, help="TCP port to listen on")
+    parser.add_argument(
+        "--uds",
+        type=str,
+        default=None,
+        help="Unix socket path to listen on (sealed mode)",
+    )
     parser.add_argument("--workdir", type=str, default="/app", help="Working directory")
     args = parser.parse_args()
+    if not args.uds and args.port is None:
+        parser.error("one of --port or --uds is required")
 
     setup_logging()
 
-    logger.debug(f"Starting server on port {args.port}, workdir={args.workdir}")
+    logger.debug(
+        f"Starting server on {args.uds or ('port ' + str(args.port))}, workdir={args.workdir}"
+    )
 
     setup_singularity_environment(args.workdir)
 
@@ -419,15 +446,21 @@ def main():
             timeout_keep_alive = 120
     except (ValueError, TypeError):
         pass
-    uvicorn.run(
-        app,
-        host="127.0.0.1",
-        port=args.port,
+    common = dict(
         access_log=False,
         server_header=False,
         timeout_graceful_shutdown=timeout_graceful_shutdown,
         timeout_keep_alive=timeout_keep_alive,
     )
+    if args.uds:
+        # A stale socket from a crashed prior run would make uvicorn fail to bind.
+        try:
+            os.unlink(args.uds)
+        except FileNotFoundError:
+            pass
+        uvicorn.run(app, uds=args.uds, **common)
+    else:
+        uvicorn.run(app, host="127.0.0.1", port=args.port, **common)
 
 
 if __name__ == "__main__":

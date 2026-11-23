@@ -12,7 +12,7 @@ Host (SLURM node)                    Singularity Container
 │                      │             │                      │
 │  - exec()            │  /exec      │  - subprocess.Popen  │
 │  - upload_file()     │  /health    │  - workdir setup     │
-│  - download_file()   │  /shutdown  │  - dpkg overlay fix  │
+│  - download_file()   │             │  - dpkg overlay fix  │
 │  - memory watchdog   │             │                      │
 └──────────────────────┘             └──────────────────────┘
          │                                     ▲
